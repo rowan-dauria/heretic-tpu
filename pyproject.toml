@@ -25,6 +25,7 @@ dependencies = [
     "huggingface-hub~=1.7",
     "jax>=0.7",
     "lm-eval~=0.4",
+    "ml-dtypes>=0.5",
     "numpy~=2.2",
     "optuna~=4.7",
     "psutil~=7.2",
@@ -52,6 +53,8 @@ dev = [
 ]
 # Reference implementations used by the parity tests (CPU-only PyTorch).
 parity = [
+    "accelerate",
+    "peft>=0.20",
     "torch",
 ]
 
@@ -83,6 +86,7 @@ torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--import-mode=importlib"
 markers = [
     "tpu: requires a TPU device",
     "slow: downloads models or runs end-to-end",
