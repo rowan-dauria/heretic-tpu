@@ -5,7 +5,7 @@ import lm_eval
 from lm_eval.models.huggingface import HFLM
 from pydantic import BaseModel, Field
 
-from heretic.scorer import Context, Score, Scorer
+from heretic_tpu.scorer import Context, Score, Scorer
 
 
 class Settings(BaseModel):

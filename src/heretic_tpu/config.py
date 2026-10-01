@@ -374,11 +374,11 @@ class Settings(BaseSettings):
     scorers: list[ScorerConfig] = Field(
         default=[
             ScorerConfig(
-                plugin="heretic.scorers.keyword_rate.KeywordRate",
+                plugin="heretic_tpu.scorers.keyword_rate.KeywordRate",
                 optimization="minimize",
             ),
             ScorerConfig(
-                plugin="heretic.scorers.kl_divergence.KLDivergence",
+                plugin="heretic_tpu.scorers.kl_divergence.KLDivergence",
                 optimization="minimize",
             ),
         ],
@@ -392,7 +392,7 @@ class Settings(BaseSettings):
     modifiers: list[ModifierConfig] = Field(
         default=[
             ModifierConfig(
-                plugin="heretic.modifiers.ara.ARA",
+                plugin="heretic_tpu.modifiers.ara.ARA",
             ),
         ],
         description=(

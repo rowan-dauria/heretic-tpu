@@ -19,9 +19,9 @@ from pydantic import (
 )
 from torch import Tensor
 
-from heretic.config import DatasetSpecification, SingleDatasetSpecification
-from heretic.modifier import Context, Modifier, Serializable
-from heretic.utils import format_dataset_specification, print
+from heretic_tpu.config import DatasetSpecification, SingleDatasetSpecification
+from heretic_tpu.modifier import Context, Modifier, Serializable
+from heretic_tpu.utils import format_dataset_specification, print
 
 
 @dataclass

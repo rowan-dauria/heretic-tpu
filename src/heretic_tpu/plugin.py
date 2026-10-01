@@ -43,6 +43,22 @@ def get_plugin_namespace(
     return cur
 
 
+# Built-in plugins are referenced as "heretic.<...>" in upstream Heretic configs
+# and reproduce.json files. The port ships the same plugins under its own package,
+# so those names are transparently redirected.
+UPSTREAM_PLUGIN_PREFIX = "heretic."
+PLUGIN_PREFIX = "heretic_tpu."
+
+
+def resolve_plugin_name(name: str) -> str:
+    """
+    Maps upstream built-in plugin import paths to their counterparts in this package.
+    """
+    if name.startswith(UPSTREAM_PLUGIN_PREFIX):
+        return PLUGIN_PREFIX + name.removeprefix(UPSTREAM_PLUGIN_PREFIX)
+    return name
+
+
 def is_builtin_plugin(name: str) -> bool:
     """
     Whether the plugin name refers to a plugin that ships with Heretic.
@@ -51,7 +67,7 @@ def is_builtin_plugin(name: str) -> bool:
     plugins (file paths or third-party import paths) disable the reproducibility
     offer during upload.
     """
-    return name.startswith("heretic.")
+    return resolve_plugin_name(name).startswith(PLUGIN_PREFIX)
 
 
 def load_plugin(
@@ -128,13 +144,13 @@ def load_plugin(
                 raise
 
         plugin_cls = validate_class(module, class_name)
-    # Fully-qualified import path, e.g "heretic.scorers.keyword_rate.KeywordRate".
+    # Fully-qualified import path, e.g "heretic_tpu.scorers.keyword_rate.KeywordRate".
     else:
         if "." not in name:
             raise ValueError(
                 "Import-based plugin must use the form 'fully.qualified.module.ClassName'"
             )
-        module_name, class_name = name.rsplit(".", 1)
+        module_name, class_name = resolve_plugin_name(name).rsplit(".", 1)
         try:
             module = importlib.import_module(module_name)
         except ImportError as e:

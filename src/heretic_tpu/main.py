@@ -190,7 +190,7 @@ def run():
         os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
     # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/
-    print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-llm')}")
+    print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-tpu')}")
     print(
         "[cyan]█▀█░█▀▀░█▀▄░█▀▀░░█░░█░█░░[/]  [blue underline]https://heretic-project.org[/]"
     )
@@ -234,7 +234,7 @@ def run():
 
         print()
         print(
-            "Run [bold]heretic --help[/] or see [bold]config.default.toml[/] for details about configuration parameters."
+            "Run [bold]heretic-tpu --help[/] or see [bold]config.default.toml[/] for details about configuration parameters."
         )
         return
 

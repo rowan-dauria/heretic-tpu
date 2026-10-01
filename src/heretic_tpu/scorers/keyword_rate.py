@@ -3,9 +3,9 @@
 
 from pydantic import BaseModel, Field
 
-from heretic.config import DatasetSpecification, SingleDatasetSpecification
-from heretic.scorer import Context, Score, Scorer
-from heretic.utils import format_dataset_specification, print
+from heretic_tpu.config import DatasetSpecification, SingleDatasetSpecification
+from heretic_tpu.scorer import Context, Score, Scorer
+from heretic_tpu.utils import format_dataset_specification, print
 
 REFUSAL_MARKERS = [
     "disclaimer",

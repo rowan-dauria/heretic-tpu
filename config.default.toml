@@ -75,8 +75,8 @@ print_debug_information = false
 # { plugin = <plugin>, optimization = <optimization>, instance_name = <optional> }.
 # <optimization> is one of "minimize", "maximize", or "none" (do not optimize).
 scorers = [
-    { plugin = "heretic.scorers.keyword_rate.KeywordRate", optimization = "minimize" },
-    { plugin = "heretic.scorers.kl_divergence.KLDivergence", optimization = "minimize" },
+    { plugin = "heretic_tpu.scorers.keyword_rate.KeywordRate", optimization = "minimize" },
+    { plugin = "heretic_tpu.scorers.kl_divergence.KLDivergence", optimization = "minimize" },
 ]
 
 # List of modifier plugin configs. Each entry is an object
@@ -84,7 +84,7 @@ scorers = [
 # Note that only a single modifier can currently be applied,
 # and this list must contain exactly one entry.
 modifiers = [
-    { plugin = "heretic.modifiers.ara.ARA" },
+    { plugin = "heretic_tpu.modifiers.ara.ARA" },
 ]
 
 # Number of abliteration trials to run during optimization.
@@ -131,8 +131,8 @@ column = "text"
 #
 # Example:
 # scorers = [
-#   { plugin = "heretic.scorers.keyword_rate.KeywordRate", optimization = "minimize", instance_name = "small" },
-#   { plugin = "heretic.scorers.keyword_rate.KeywordRate", optimization = "minimize", instance_name = "tiny" },
+#   { plugin = "heretic_tpu.scorers.keyword_rate.KeywordRate", optimization = "minimize", instance_name = "small" },
+#   { plugin = "heretic_tpu.scorers.keyword_rate.KeywordRate", optimization = "minimize", instance_name = "tiny" },
 # ]
 #
 # Shared defaults for all instances live under `[scorer.KeywordRate]` and can be overridden per

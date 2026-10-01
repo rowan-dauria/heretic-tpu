@@ -5,13 +5,13 @@ import unittest
 
 from pydantic import ValidationError
 
-from heretic.config import ScorerConfig
+from heretic_tpu.config import ScorerConfig
 
 
 class ScorerConfigTests(unittest.TestCase):
     def test_accepts_slug_like_instance_name(self) -> None:
         config = ScorerConfig(
-            plugin="heretic.scorers.keyword_rate.KeywordRate",
+            plugin="heretic_tpu.scorers.keyword_rate.KeywordRate",
             optimization="minimize",
             instance_name="small-1",
         )
@@ -21,7 +21,7 @@ class ScorerConfigTests(unittest.TestCase):
     def test_rejects_empty_instance_name(self) -> None:
         with self.assertRaises(ValidationError):
             ScorerConfig(
-                plugin="heretic.scorers.keyword_rate.KeywordRate",
+                plugin="heretic_tpu.scorers.keyword_rate.KeywordRate",
                 optimization="minimize",
                 instance_name=" \t",
             )
@@ -33,7 +33,7 @@ class ScorerConfigTests(unittest.TestCase):
                     ValidationError, "whitespace is not allowed"
                 ):
                     ScorerConfig(
-                        plugin="heretic.scorers.keyword_rate.KeywordRate",
+                        plugin="heretic_tpu.scorers.keyword_rate.KeywordRate",
                         optimization="minimize",
                         instance_name=instance_name,
                     )
@@ -41,7 +41,7 @@ class ScorerConfigTests(unittest.TestCase):
     def test_rejects_dot_in_instance_name(self) -> None:
         with self.assertRaisesRegex(ValidationError, "'\\.' is not allowed"):
             ScorerConfig(
-                plugin="heretic.scorers.keyword_rate.KeywordRate",
+                plugin="heretic_tpu.scorers.keyword_rate.KeywordRate",
                 optimization="minimize",
                 instance_name="small.name",
             )
