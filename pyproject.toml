@@ -1,0 +1,89 @@
+[project]
+name = "heretic-tpu"
+version = "0.1.0.dev0"
+description = "TPU (JAX) port of Heretic: fully automatic censorship removal for language models"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+authors = [
+    { name = "Philipp Emanuel Weidmann", email = "pew@worldwidemann.com" },
+]
+requires-python = ">=3.11"
+keywords = ["llm", "transformer", "abliteration", "tpu", "jax"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "datasets~=4.7",
+    "huggingface-hub~=1.7",
+    "jax>=0.7",
+    "lm-eval~=0.4",
+    "numpy~=2.2",
+    "optuna~=4.7",
+    "psutil~=7.2",
+    "py-cpuinfo~=9.0",
+    "pydantic-settings~=2.13",
+    "questionary~=2.1",
+    "rich~=14.3",
+    "safetensors>=0.6",
+    "tomli-w~=1.2",
+    "tqdm~=4.67",
+    # Only tokenizers, configs and chat templates are used; PyTorch is not required.
+    "transformers~=5.6",
+]
+
+[project.optional-dependencies]
+tpu = [
+    "jax[tpu]>=0.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.14.5",
+    "ty>=0.0.5",
+]
+# Reference implementations used by the parity tests (CPU-only PyTorch).
+parity = [
+    "torch",
+]
+
+[project.urls]
+Repository = "https://github.com/p-e-w/heretic"
+Upstream = "https://heretic-project.org"
+
+[project.scripts]
+heretic-tpu = "heretic_tpu.main:main"
+
+[build-system]
+requires = ["uv_build>=0.8.11,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+exclude-newer = "7 days"
+default-groups = ["dev"]
+
+[tool.uv.build-backend]
+module-name = "heretic_tpu"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "tpu: requires a TPU device",
+    "slow: downloads models or runs end-to-end",
+]
