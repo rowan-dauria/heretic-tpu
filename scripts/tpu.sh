@@ -5,7 +5,8 @@
 #
 # Usage:
 #   scripts/tpu.sh setup        Install uv and the shared virtual environment on the VM.
-#   scripts/tpu.sh sync         Copy the working tree (tracked and untracked, non-ignored files).
+#   scripts/tpu.sh sync         Copy the working tree (tracked and untracked, non-ignored files,
+#                               plus the git-ignored .scratch/ directory).
 #   scripts/tpu.sh run CMD...   Sync, then run CMD inside the synced tree on the VM.
 #   scripts/tpu.sh exec CMD...  Like run, but without syncing first.
 #   scripts/tpu.sh submit NAME CMD...
@@ -62,12 +63,15 @@ EOF
 
 do_sync() {
     # Remove previously synced code first so that deleted files don't linger.
+    # The git-ignored .scratch/ directory is synced as well, for throwaway scripts
+    # that should run on the VM rather than locally.
     (
         cd "$REPO_ROOT"
-        git ls-files -z --cached --others --exclude-standard |
-            grep -zv '^heretic$' |
-            COPYFILE_DISABLE=1 tar --null -T - -czf -
-    ) | ssh_tpu --command="mkdir -p \"\$HOME/$REMOTE_DIR\" && cd \"\$HOME/$REMOTE_DIR\" && rm -rf src tests scripts && tar -xzf - 2>/dev/null"
+        {
+            git ls-files -z --cached --others --exclude-standard | grep -zv '^heretic$'
+            if [ -d .scratch ]; then find .scratch -type f -print0; fi
+        } | COPYFILE_DISABLE=1 tar --null -T - -czf -
+    ) | ssh_tpu --command="mkdir -p \"\$HOME/$REMOTE_DIR\" && cd \"\$HOME/$REMOTE_DIR\" && rm -rf src tests scripts .scratch && tar -xzf - 2>/dev/null"
 }
 
 do_exec() {

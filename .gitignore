@@ -13,6 +13,9 @@ wheels/
 /.ruff_cache/
 /.pytest_cache/
 
+# Throwaway scripts (synced to the TPU VM by scripts/tpu.sh)
+/.scratch/
+
 # Editors
 /.vscode/
 /.idea/
