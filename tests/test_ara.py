@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from jax._src.dispatch import BACKEND_COMPILE_EVENT
 
 from heretic_tpu.backend import lbfgs
 from heretic_tpu.config import SingleDatasetSpecification
@@ -480,31 +481,95 @@ def test_one_compile_for_all_neighbor_counts(fake_prompts: None) -> None:
         layer_count=3,
         shapes={"attn.o_proj": (24, 20), "mlp.down_proj": (24, 36)},
     )
+    # Several steps per module, whose state the previous step returns.
     modifier, ctx = make_modifier(
         model,
         lora_rank=2,
-        n_optimization_steps=1,
+        n_optimization_steps=2,
         max_iter=2,
     )
 
+    # Committed and uncommitted arguments (the first step's and those returned by the
+    # previous step) compile to separate programs, which the cache size doesn't show.
+    compiles = []
+
+    def record_compile(event: str, duration: float, **kwargs: Any) -> None:
+        if (
+            event == BACKEND_COMPILE_EVENT
+            and kwargs.get("fun_name") == "jit(ara_optimise)"
+        ):
+            compiles.append(duration)
+
     cache_size = ara_optimise._cache_size()
     rng = np.random.default_rng(0)
-    for neighbor_count in range(1, NEIGHBOR_COUNT_MAX + 1):
+    jax.monitoring.register_event_duration_secs_listener(record_compile)
+    try:
+        for neighbor_count in range(1, NEIGHBOR_COUNT_MAX + 1):
+            modifier.reset_model(ctx)
+            modifier.modify_model(
+                ctx,
+                Parameters(
+                    start_layer_index=int(rng.integers(0, 2)),
+                    end_layer_index=3,
+                    preserve_good_behavior_weight=float(rng.uniform(0, 1)),
+                    steer_bad_behavior_weight=float(rng.uniform(1e-4, 1)),
+                    overcorrect_relative_weight=float(rng.uniform(0, 1.3)),
+                    neighbor_count=neighbor_count,
+                ),
+            )
+    finally:
+        jax.monitoring.unregister_event_duration_listener(record_compile)
+
+    # One program per component shape.
+    assert ara_optimise._cache_size() - cache_size == 2
+    assert len(compiles) == 2
+
+
+def test_later_trials_compile_nothing(fake_prompts: None) -> None:
+    # Shapes no other test uses, so that every compile is seen.
+    model = FakeModel.random(
+        fake_settings(),
+        layer_count=4,
+        shapes={"attn.o_proj": (20, 24), "mlp.down_proj": (20, 28)},
+    )
+    modifier, ctx = make_modifier(
+        model,
+        lora_rank=2,
+        n_optimization_steps=2,
+        max_iter=2,
+    )
+
+    def run_trial(start_layer_index: int, end_layer_index: int) -> None:
         modifier.reset_model(ctx)
         modifier.modify_model(
             ctx,
             Parameters(
-                start_layer_index=int(rng.integers(0, 2)),
-                end_layer_index=3,
-                preserve_good_behavior_weight=float(rng.uniform(0, 1)),
-                steer_bad_behavior_weight=float(rng.uniform(1e-4, 1)),
-                overcorrect_relative_weight=float(rng.uniform(0, 1.3)),
-                neighbor_count=neighbor_count,
+                start_layer_index=start_layer_index,
+                end_layer_index=end_layer_index,
+                preserve_good_behavior_weight=0.5,
+                steer_bad_behavior_weight=0.1,
+                overcorrect_relative_weight=0.5,
+                neighbor_count=3,
             ),
         )
 
-    # One program per component shape.
-    assert ara_optimise._cache_size() - cache_size == 2
+    run_trial(0, 4)
+
+    # Layer ranges of other lengths reuse the programs of the first trial.
+    compiles = []
+
+    def record_compile(event: str, duration: float, **kwargs: Any) -> None:
+        if event == BACKEND_COMPILE_EVENT:
+            compiles.append(kwargs.get("fun_name"))
+
+    jax.monitoring.register_event_duration_secs_listener(record_compile)
+    try:
+        for start_layer_index, end_layer_index in [(1, 4), (2, 3), (0, 1)]:
+            run_trial(start_layer_index, end_layer_index)
+    finally:
+        jax.monitoring.unregister_event_duration_listener(record_compile)
+
+    assert compiles == []
 
 
 def ara_optimise_arguments(

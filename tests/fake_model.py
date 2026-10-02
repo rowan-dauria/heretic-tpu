@@ -56,6 +56,9 @@ winsorization_quantile=1.0)` and `get_module_io_batched(prompts)`.
   dropped, `lora_rank` becomes None, and it returns False.
 * `set_lora` checks shapes, casts to float32 and counts its calls per component in
   `set_lora_calls`.
+* Weights and adapters are committed to the default device at the time they are
+  created, as the facade places its arrays with `jax.device_put` (JAX compiles
+  separate programs for committed and uncommitted arguments).
 * Module outputs are computed like the engine's adapted modules:
   `base(x) = x @ Wᵀ` with float32 accumulation, rounded to the model dtype, and with
   adapters `(base(x).astype(f32) + (x.astype(f32) @ Aᵀ) @ Bᵀ).astype(dtype)`.
@@ -86,6 +89,17 @@ def fake_settings(**fields: Any) -> Settings:
     return Settings.model_construct(**({"model": "fake/model", "seed": 0} | fields))
 
 
+def place(array: Array) -> jax.Array:
+    """Commits an array to the default device, as the facade places its arrays."""
+
+    device = jax.config.jax_default_device
+    if device is None:
+        device = jax.devices()[0]
+    elif isinstance(device, str):
+        device = jax.devices(device)[0]
+    return jax.device_put(array, device)
+
+
 def prompt_rng(prompt: Prompt, purpose: str) -> np.random.Generator:
     """A random generator determined by the text of a prompt (not by Python's
     per-process string hashing)."""
@@ -105,7 +119,8 @@ class FakeModel:
     ):
         self.settings = settings
         self.weights = {
-            component: jnp.asarray(weights[component]) for component in sorted(weights)
+            component: place(jnp.asarray(weights[component]))
+            for component in sorted(weights)
         }
         self.residuals = residuals or self.random_residuals
         self.module_io = module_io or self.adapted_module_io
@@ -175,7 +190,7 @@ class FakeModel:
                 bound,
             )
             B = jnp.zeros((layer_count, module_count, d_out, lora_rank), jnp.float32)
-            self.adapters[component] = (A, B)
+            self.adapters[component] = (place(A), place(B))
         self.lora_rank = lora_rank
 
     def get_lora(self, component: str) -> tuple[jax.Array, jax.Array]:
@@ -190,8 +205,8 @@ class FakeModel:
                 f"{old_A.shape}, {old_B.shape}"
             )
         self.adapters[component] = (
-            jnp.asarray(A, jnp.float32),
-            jnp.asarray(B, jnp.float32),
+            place(jnp.asarray(A, jnp.float32)),
+            place(jnp.asarray(B, jnp.float32)),
         )
         self.set_lora_calls[component] += 1
 

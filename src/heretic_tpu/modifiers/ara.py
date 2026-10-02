@@ -466,6 +466,13 @@ class ARA(Modifier[Parameters]):
                         lora_A.size + lora_B.size,
                         self.settings.history_size,
                     )
+                    # Every step returns committed arrays, and JAX compiles separate
+                    # programs for committed and uncommitted arguments, so the first
+                    # step's are committed too (B is replicated in every plan).
+                    lora_A, lora_B, state = jax.device_put(
+                        (lora_A, lora_B, state),
+                        lora_B.sharding,
+                    )
 
                     # Move I/O tensors to the device, in float32.
                     good_input = jnp.asarray(
@@ -519,15 +526,26 @@ class ARA(Modifier[Parameters]):
             if not adapters:
                 continue
 
-            layer_indices, module_indices = np.array(list(adapters)).T
-            lora_A, lora_B = reset_adapters[component]
-            lora_A = lora_A.at[layer_indices, module_indices].set(
-                jnp.stack([A for A, _ in adapters.values()])
+            # Every module's adapters, optimised or reset, are stacked, so that the
+            # stacked arrays have the same shapes in every trial, whatever its layer
+            # range, and compile only once.
+            reset_A, reset_B = reset_adapters[component]
+            layer_count, module_count = reset_A.shape[:2]
+            modules = [
+                adapters[layer_index, module_index]
+                if (layer_index, module_index) in adapters
+                else (
+                    reset_A[layer_index, module_index],
+                    reset_B[layer_index, module_index],
+                )
+                for layer_index in range(layer_count)
+                for module_index in range(module_count)
+            ]
+            model.set_lora(
+                component,
+                jnp.stack([A for A, _ in modules]).reshape(reset_A.shape),
+                jnp.stack([B for _, B in modules]).reshape(reset_B.shape),
             )
-            lora_B = lora_B.at[layer_indices, module_indices].set(
-                jnp.stack([B for _, B in adapters.values()])
-            )
-            model.set_lora(component, lora_A, lora_B)
 
     def reset_model(self, ctx: Context) -> None:
         model = ctx.get_model()
