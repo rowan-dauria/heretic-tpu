@@ -4,26 +4,30 @@
 # Arbitrary-Rank Ablation (ARA) (Weidmann 2026)
 # See https://github.com/p-e-w/heretic/pull/211 for more information.
 
+import functools
 from dataclasses import asdict, dataclass
-from typing import Any, cast
+from typing import Any, NamedTuple
 
-import bitsandbytes as bnb
-import torch
-import torch.linalg as LA
-import torch.nn.functional as F
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import Array, lax
 from optuna import Trial
-from peft.tuners.lora.layer import Linear
 from pydantic import (
     BaseModel,
     Field,
     PositiveInt,
 )
-from torch import Tensor
-from torch.optim import LBFGS
 
+from heretic_tpu.backend import lbfgs, linalg
 from heretic_tpu.config import DatasetSpecification, SingleDatasetSpecification
 from heretic_tpu.modifier import Context, Modifier, Serializable
 from heretic_tpu.utils import format_dataset_specification, print
+
+# The largest neighbour count that suggest_parameters samples. ara_optimise always
+# ranks this many nearest neighbours and averages a traced prefix of them,
+# so that every neighbour count shares one compiled program.
+NEIGHBOR_COUNT_MAX = 15
 
 
 @dataclass
@@ -113,51 +117,214 @@ class Settings(BaseModel):
     )
 
 
-# For each vector in the 2D-tensor `a`, computes the mean Euclidean distance
-# to the `k` nearest neighbors of the vector among the vectors in the 2D-tensor `b`.
-def mean_distances_to_knn(a: Tensor, b: Tensor, k: int) -> Tensor:
-    distances = torch.cdist(a, b)
-    nearest_distances, _ = distances.topk(k, dim=1, largest=False)
-    return nearest_distances.mean(1)
+class ObjectiveData(NamedTuple):
+    """The arrays that ARA's objective for a module depends on."""
+
+    W_base: Array  # [d_out, d_in], the base weight in float32
+    W_row_norms: Array  # [d_out, 1]
+    good_input: Array  # [N_good, d_in]
+    good_output: Array  # [N_good, d_out]
+    bad_input: Array  # [N_bad, d_in]
+    bad_output: Array  # [N_bad, d_out]
+    # [3]: preserve_good_behavior_weight, steer_bad_behavior_weight
+    # and overcorrect_relative_weight.
+    loss_weights: Array
+    neighbor_count: Array  # int32 []
 
 
 # The objective function at the heart of ARA.
+# `k_max_good` and `k_max_bad` are static upper bounds of the traced
+# `neighbor_count` (see linalg.knn_mean).
 def ara_loss(
-    good_output: Tensor,
-    bad_output: Tensor,
-    new_good_output: Tensor,
-    new_bad_output: Tensor,
-    parameters: Parameters,
-) -> Tensor:
+    good_output: Array,
+    bad_output: Array,
+    new_good_output: Array,
+    new_bad_output: Array,
+    loss_weights: Array,
+    neighbor_count: Array,
+    k_max_good: int,
+    k_max_bad: int,
+) -> Array:
+    (
+        preserve_good_behavior_weight,
+        steer_bad_behavior_weight,
+        overcorrect_relative_weight,
+    ) = loss_weights
+
     # The outputs for "good" prompts should change as little as possible.
-    preserve_good_behavior = ((new_good_output - good_output) ** 2).mean()
+    preserve_good_behavior = jnp.mean((new_good_output - good_output) ** 2)
 
     steer_bad_behavior = (
         # Pull the outputs for "bad" prompts towards
         # the original outputs for "good" prompts.
-        mean_distances_to_knn(
-            new_bad_output,
-            good_output,
-            parameters.neighbor_count,
-        ).mean()
+        jnp.mean(
+            linalg.knn_mean(
+                new_bad_output,
+                good_output,
+                neighbor_count,
+                k_max_good,
+            )
+        )
         # Push the outputs for "bad" prompts away from
         # the original outputs for "bad" prompts.
         # In combination with the above, this overcorrects
         # away from the original residuals, which results
         # in stronger steering that can overcome more complex
         # refusal mechanisms.
-        + parameters.overcorrect_relative_weight
-        * -mean_distances_to_knn(
-            new_bad_output,
-            bad_output,
-            parameters.neighbor_count,
-        ).mean()
+        + overcorrect_relative_weight
+        * -jnp.mean(
+            linalg.knn_mean(
+                new_bad_output,
+                bad_output,
+                neighbor_count,
+                k_max_bad,
+            )
+        )
     )
 
     return (
-        parameters.preserve_good_behavior_weight * preserve_good_behavior
-        + parameters.steer_bad_behavior_weight * steer_bad_behavior
+        preserve_good_behavior_weight * preserve_good_behavior
+        + steer_bad_behavior_weight * steer_bad_behavior
     )
+
+
+def objective(
+    x: Array,
+    data: ObjectiveData,
+    *,
+    preserve_row_magnitudes: bool,
+    k_max_good: int,
+    k_max_bad: int,
+) -> Array:
+    """
+    ARA's loss for a module, as a function of its flattened LoRA matrices
+    `x = concat(A.ravel(), B.ravel())`.
+    """
+
+    d_out, d_in = data.W_base.shape
+    rank = x.size // (d_in + d_out)
+    A = x[: rank * d_in].reshape(rank, d_in)
+    B = x[rank * d_in :].reshape(d_out, rank)
+
+    # Calculate effective weight after applying adapter.
+    W_eff = data.W_base + jnp.matmul(B, A, precision=lax.Precision.HIGHEST)
+
+    if preserve_row_magnitudes:
+        # Normalize to unit length, then scale by original norms,
+        # preserving the original row norms.
+        W_eff = linalg.normalize(W_eff, axis=1) * data.W_row_norms
+
+    # Compute outputs using the effective weight.
+    new_good_output = jnp.matmul(
+        data.good_input,
+        W_eff.T,
+        precision=lax.Precision.HIGHEST,
+    )
+    new_bad_output = jnp.matmul(
+        data.bad_input,
+        W_eff.T,
+        precision=lax.Precision.HIGHEST,
+    )
+
+    return ara_loss(
+        data.good_output,
+        data.bad_output,
+        new_good_output,
+        new_bad_output,
+        data.loss_weights,
+        data.neighbor_count,
+        k_max_good,
+        k_max_bad,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "preserve_row_magnitudes",
+        "max_iter",
+        "history_size",
+        "learning_rate",
+        "k_max_good",
+        "k_max_bad",
+    ],
+    donate_argnames=["A", "B", "state"],
+)
+def ara_optimise(
+    A: Array,
+    B: Array,
+    W_stack: Array,
+    layer: Array,
+    module: Array,
+    good_in: Array,
+    good_out: Array,
+    bad_in: Array,
+    bad_out: Array,
+    loss_weights: Array,
+    k: Array,
+    state: lbfgs.LBFGSState,
+    *,
+    preserve_row_magnitudes: bool,
+    max_iter: int,
+    history_size: int,
+    learning_rate: float,
+    k_max_good: int,
+    k_max_bad: int,
+) -> tuple[Array, Array, lbfgs.LBFGSState, Array]:
+    """
+    One (outer) L-BFGS optimisation step on ARA's objective for a module,
+    as `torch.optim.LBFGS.step` with the strong Wolfe line search performs it.
+
+    `A [r, d_in]` and `B [d_out, r]` are the module's LoRA matrices (float32),
+    and `state` is the optimizer state it carries across steps. These three are
+    donated. `W_stack` holds the base weights of the component `[L, M, d_out, d_in]`,
+    of which the module's is `W_stack[layer, module]`. The module I/O
+    (`good_in [N_good, d_in]`, `good_out [N_good, d_out]`, `bad_in [N_bad, d_in]`,
+    `bad_out [N_bad, d_out]`) is float32, `loss_weights` holds the weights of
+    `ara_loss` and `k` is the neighbour count (int32), where
+    `1 <= k <= k_max_good <= N_good` and `k <= k_max_bad <= N_bad`.
+
+    Only the keyword arguments are static, so a single compiled program serves
+    every module of a component, every trial and every neighbour count.
+
+    Returns the new A, B and state, and the loss before the step.
+    """
+
+    # We need the base weight in float32 (the dtype of the adapters)
+    # to compute the effective weight.
+    W_base = W_stack[layer, module].astype(A.dtype)
+
+    data = ObjectiveData(
+        W_base=W_base,
+        # Pre-calculate the original row norms to preserve them.
+        # See https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
+        W_row_norms=jnp.linalg.norm(W_base, axis=1, keepdims=True),
+        good_input=good_in,
+        good_output=good_out,
+        bad_input=bad_in,
+        bad_output=bad_out,
+        loss_weights=loss_weights,
+        neighbor_count=k,
+    )
+
+    # Like PyTorch's optimisers, L-BFGS works on the parameters
+    # flattened and concatenated in order.
+    x, state, loss = lbfgs.step(
+        functools.partial(
+            objective,
+            preserve_row_magnitudes=preserve_row_magnitudes,
+            k_max_good=k_max_good,
+            k_max_bad=k_max_bad,
+        ),
+        jnp.concatenate([A.ravel(), B.ravel()]),
+        state,
+        data,
+        lr=learning_rate,
+        max_iter=max_iter,
+        history_size=history_size,
+    )
+
+    return x[: A.size].reshape(A.shape), x[A.size :].reshape(B.shape), state, loss
 
 
 class ARA(Modifier[Parameters]):
@@ -232,7 +399,7 @@ class ARA(Modifier[Parameters]):
         neighbor_count = trial.suggest_int(
             "neighbor_count",
             1,
-            15,
+            NEIGHBOR_COUNT_MAX,
         )
 
         return Parameters(
@@ -247,102 +414,120 @@ class ARA(Modifier[Parameters]):
     def modify_model(self, ctx: Context, parameters: Parameters) -> None:
         model = ctx.get_model()
 
+        loss_weights = np.array(
+            [
+                parameters.preserve_good_behavior_weight,
+                parameters.steer_bad_behavior_weight,
+                parameters.overcorrect_relative_weight,
+            ],
+            np.float32,
+        )
+        neighbor_count = parameters.neighbor_count
+
+        components = model.get_abliterable_components()
+        # Optimisation starts from the reset adapters (B = 0),
+        # which modules outside the layer range keep.
+        reset_adapters = {
+            component: model.get_lora(component) for component in components
+        }
+        optimised_adapters: dict[str, dict[tuple[int, int], tuple[Array, Array]]] = {
+            component: {} for component in components
+        }
+
         for layer_index in range(
             parameters.start_layer_index,
             parameters.end_layer_index,
         ):
-            for component, modules in model.get_layer_modules(layer_index).items():
-                for module_index, module in enumerate(modules):
-                    # Cast to Linear to access weights and LoRA adapters.
-                    module = cast(Linear, module)
+            for component in components:
+                good_inputs, good_outputs = self.good_module_io[component]
+                bad_inputs, bad_outputs = self.bad_module_io[component]
+                good_count = good_inputs.shape[2]
+                bad_count = bad_inputs.shape[2]
 
-                    # We need the base weight in float32 to compute the effective weight.
-                    base_weight = cast(Tensor, module.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
-
-                    if quant_state is None:
-                        W_base = base_weight.to(torch.float32)
-                    else:
-                        # Use the original dequantization logic from bitsandbytes.
-                        W_base = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
-                        )
-
-                    # Pre-calculate the original row norms to preserve them.
-                    # See https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-                    W_row_norms = cast(
-                        Tensor,
-                        LA.vector_norm(W_base, dim=1, keepdim=True).detach(),
+                # torch.topk raises for these in upstream.
+                if not 1 <= neighbor_count <= min(good_count, bad_count):
+                    raise ValueError(
+                        f"neighbor_count is {neighbor_count}, but must be between 1 and "
+                        f"the number of good and bad prompts ({min(good_count, bad_count)})"
                     )
 
+                # A single compiled program serves every neighbour count
+                # up to NEIGHBOR_COUNT_MAX.
+                k_max = max(neighbor_count, NEIGHBOR_COUNT_MAX)
+
+                reset_A, reset_B = reset_adapters[component]
+                W_stack = model.get_base_weights(component)
+
+                for module_index in range(model.get_module_count(component)):
                     # We optimize the LoRA weights A and B.
-                    lora_A = cast(Tensor, module.lora_A["default"].weight)
-                    lora_B = cast(Tensor, module.lora_B["default"].weight)
-
-                    # Move I/O tensors to the device of the adapter weights.
-                    good_input, good_output = self.good_module_io[layer_index][
-                        component
-                    ][module_index]
-                    bad_input, bad_output = self.bad_module_io[layer_index][component][
-                        module_index
-                    ]
-
-                    good_input = good_input.float().to(lora_A.device)
-                    good_output = good_output.float().to(lora_A.device)
-                    bad_input = bad_input.float().to(lora_A.device)
-                    bad_output = bad_output.float().to(lora_A.device)
-
-                    def objective(A: Tensor, B: Tensor) -> Tensor:
-                        # Calculate effective weight after applying adapter.
-                        W_eff = W_base + (B @ A)
-
-                        if self.settings.preserve_row_magnitudes:
-                            # Normalize to unit length, then scale by original norms,
-                            # preserving the original row norms.
-                            W_eff = F.normalize(W_eff, p=2, dim=1) * W_row_norms
-
-                        # Compute outputs using the effective weight.
-                        new_good_output = good_input @ W_eff.T
-                        new_bad_output = bad_input @ W_eff.T
-
-                        return ara_loss(
-                            good_output,
-                            bad_output,
-                            new_good_output,
-                            new_bad_output,
-                            parameters,
-                        )
-
-                    optimizer = LBFGS(
-                        [lora_A, lora_B],
-                        lr=self.settings.learning_rate,
-                        max_iter=self.settings.max_iter,
-                        history_size=self.settings.history_size,
-                        line_search_fn="strong_wolfe",
+                    lora_A = reset_A[layer_index, module_index]
+                    lora_B = reset_B[layer_index, module_index]
+                    state = lbfgs.init(
+                        lora_A.size + lora_B.size,
+                        self.settings.history_size,
                     )
 
-                    def closure() -> Tensor:
-                        optimizer.zero_grad()
-                        loss = objective(lora_A, lora_B)
-                        loss.backward()
-                        return loss
+                    # Move I/O tensors to the device, in float32.
+                    good_input = jnp.asarray(
+                        good_inputs[layer_index, module_index], jnp.float32
+                    )
+                    good_output = jnp.asarray(
+                        good_outputs[layer_index, module_index], jnp.float32
+                    )
+                    bad_input = jnp.asarray(
+                        bad_inputs[layer_index, module_index], jnp.float32
+                    )
+                    bad_output = jnp.asarray(
+                        bad_outputs[layer_index, module_index], jnp.float32
+                    )
 
                     for step in range(self.settings.n_optimization_steps):
-                        loss = optimizer.step(closure)
+                        lora_A, lora_B, state, loss = ara_optimise(
+                            lora_A,
+                            lora_B,
+                            W_stack,
+                            np.int32(layer_index),
+                            np.int32(module_index),
+                            good_input,
+                            good_output,
+                            bad_input,
+                            bad_output,
+                            loss_weights,
+                            np.int32(neighbor_count),
+                            state,
+                            preserve_row_magnitudes=self.settings.preserve_row_magnitudes,
+                            max_iter=self.settings.max_iter,
+                            history_size=self.settings.history_size,
+                            learning_rate=self.settings.learning_rate,
+                            k_max_good=min(k_max, good_count),
+                            k_max_bad=min(k_max, bad_count),
+                        )
                         if self.settings.print_loss:
                             print(
                                 f"\\[{layer_index}/{component}/{module_index}] Step: {step + 1}, Loss: {loss.item():.6f}"
                             )
 
-                    # Free the gradient buffers accumulated during optimization.
-                    # Without this, they persist on the model (one full-size gradient
-                    # per processed weight) and can easily consume tens of GB of VRAM,
-                    # causing out-of-memory errors during the subsequent evaluation.
-                    optimizer.zero_grad(set_to_none=True)
+                    # Finish the module before starting the next one, so that only
+                    # one module's I/O is on the device at a time.
+                    jax.block_until_ready((lora_A, lora_B))
+                    optimised_adapters[component][layer_index, module_index] = (
+                        lora_A,
+                        lora_B,
+                    )
+
+        for component, adapters in optimised_adapters.items():
+            if not adapters:
+                continue
+
+            layer_indices, module_indices = np.array(list(adapters)).T
+            lora_A, lora_B = reset_adapters[component]
+            lora_A = lora_A.at[layer_indices, module_indices].set(
+                jnp.stack([A for A, _ in adapters.values()])
+            )
+            lora_B = lora_B.at[layer_indices, module_indices].set(
+                jnp.stack([B for _, B in adapters.values()])
+            )
+            model.set_lora(component, lora_A, lora_B)
 
     def reset_model(self, ctx: Context) -> None:
         model = ctx.get_model()

@@ -1,24 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import functools
 import math
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, cast
 
-import bitsandbytes as bnb
-import torch
-import torch.linalg as LA
-import torch.nn.functional as F
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import Array, lax
 from optuna import Trial
-from peft.tuners.lora.layer import Linear
 from pydantic import (
     BaseModel,
     Field,
     PositiveInt,
 )
-from torch import Tensor
 
+from heretic_tpu.backend import linalg
 from heretic_tpu.config import DatasetSpecification, SingleDatasetSpecification
 from heretic_tpu.modifier import Context, Modifier, Serializable
 from heretic_tpu.utils import format_dataset_specification, print
@@ -134,6 +134,144 @@ class Settings(BaseModel):
     )
 
 
+# F.normalize(x, p=2, dim=axis) for the residual directions,
+# which are computed on the host in the dtype of x (float32).
+def normalize(x: np.ndarray, axis: int) -> np.ndarray:
+    return x / np.maximum(np.linalg.norm(x, axis=axis, keepdims=True), 1e-12)
+
+
+# torch.lerp with a scalar weight, in the dtype of start and end.
+# Like PyTorch, it switches between two formulas at 0.5 for accuracy.
+def lerp(start: np.ndarray, end: np.ndarray, weight: float) -> np.ndarray:
+    weight = start.dtype.type(weight)
+    if abs(weight) < 0.5:
+        return start + weight * (end - start)
+    else:
+        return end - (end - start) * (1 - weight)
+
+
+@functools.partial(jax.jit, static_argnames=["row_normalization"])
+def get_adapters(
+    W: Array,
+    residual_directions: Array,
+    weights: Array,
+    apply: Array,
+    A_reset: Array,
+    key: Array,
+    *,
+    row_normalization: RowNormalization,
+) -> tuple[Array, Array]:
+    """
+    Computes the abliteration LoRA adapters of all modules of a component.
+
+    `W` holds the base weights of the component's modules `[L, M, d_out, d_in]`
+    in the model dtype, `residual_directions` the direction to ablate in each
+    layer `[L, d_out]`, `weights` the ablation weight of each layer `[L]`,
+    `apply` whether to ablate each layer `[L]`, and `A_reset` the reset LoRA
+    A matrices `[L, M, r, d_in]`. `key` seeds the randomised SVD that "full"
+    row normalisation uses.
+
+    Returns the LoRA matrices `(A [L, M, r, d_in], B [L, M, d_out, r])`
+    in float32. Modules that are not ablated keep `A_reset` and get `B = 0`.
+    """
+
+    layer_count, module_count, d_out, d_in = W.shape
+    r = A_reset.shape[2]
+
+    def ablate(
+        W: Array,
+        v: Array,
+        weight: Array,
+        A_reset: Array,
+    ) -> tuple[Array, Array]:
+        # LoRA abliteration: delta W = -lambda * v * (v^T W)
+        # lora_B = -lambda * v
+        # lora_A = v^T W
+        W = W.astype(jnp.float32)
+
+        if row_normalization == RowNormalization.FULL:
+            # Keep a reference to the original weight matrix so we can subtract it later.
+            W_org = W
+
+        if row_normalization != RowNormalization.NONE:
+            # Get the row norms.
+            W_row_norms = jnp.linalg.norm(W, axis=1, keepdims=True)
+            # Normalize the weight matrix along the rows.
+            W = linalg.normalize(W, axis=1)
+
+        # Calculate lora_A = v^T W
+        # v is (d_out,), W is (d_out, d_in)
+        # v @ W -> (d_in,)
+        lora_A = jnp.matmul(v, W, precision=lax.Precision.HIGHEST).reshape(1, -1)
+
+        # Calculate lora_B = -weight * v
+        # v is (d_out,)
+        lora_B = (-weight * v).reshape(-1, 1)
+
+        if row_normalization == RowNormalization.PRE:
+            # Make the LoRA adapter apply to the original weight matrix.
+            lora_B = W_row_norms * lora_B
+        elif row_normalization == RowNormalization.FULL:
+            # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
+            W = W + jnp.matmul(lora_B, lora_A, precision=lax.Precision.HIGHEST)
+            # Normalize the adjusted weight matrix along the rows.
+            W = linalg.normalize(W, axis=1)
+            # Restore the original row norms of the weight matrix.
+            W = W * W_row_norms
+            # Subtract the original matrix to turn W into a delta.
+            W = W - W_org
+            # Use a low-rank SVD to get an approximation of the matrix.
+            # svd_lowrank is randomised. Upstream reseeds immediately before every
+            # call, so every module uses the same key.
+            U, S, V = linalg.svd_lowrank(W, q=2 * r + 4, niter=6, key=key)
+
+            # Truncate it to the part we want to store in the LoRA adapter.
+            U = U[:, :r]
+            S = S[:r]
+            Vh = V[:, :r].T
+            # Transfer it into the LoRA adapter components. Split the singular values
+            # evenly between the two components to keep their norms balanced and avoid
+            # potential issues with numerical stability.
+            sqrt_S = jnp.sqrt(S)
+            # U @ diag(sqrt_S) and diag(sqrt_S) @ Vh, which are exact scalings.
+            lora_B = U * sqrt_S
+            lora_A = sqrt_S[:, None] * Vh
+
+        return lora_A, lora_B
+
+    def skip(
+        W: Array,
+        v: Array,
+        weight: Array,
+        A_reset: Array,
+    ) -> tuple[Array, Array]:
+        # Leave the adapter at identity, without touching the weights.
+        return A_reset, jnp.zeros((d_out, r), jnp.float32)
+
+    def process_module(module: tuple[Array, ...]) -> tuple[Array, Array]:
+        W, v, weight, apply, A_reset = module
+        return lax.cond(apply, ablate, skip, W, v, weight, A_reset)
+
+    # The modules are processed one at a time: lax.map without a batch size is
+    # a scan, inside which lax.cond runs only the selected branch. (With a batch
+    # size, lax.map would vmap the body, which turns the conditional into a select
+    # that runs both branches.) So at most one module's float32 working set is
+    # live, the weights are never converted to float32 as a whole, and modules
+    # that are not ablated cost nothing.
+    A, B = lax.map(
+        process_module,
+        (
+            W.reshape(-1, d_out, d_in),
+            jnp.repeat(residual_directions, module_count, axis=0),
+            jnp.repeat(weights, module_count),
+            jnp.repeat(apply, module_count),
+            A_reset.reshape(-1, r, d_in),
+        ),
+    )
+
+    return A.reshape(A_reset.shape), B.reshape(layer_count, module_count, d_out, r)
+
+
 class Abliteration(Modifier[Parameters]):
     settings: Settings
 
@@ -184,34 +322,21 @@ class Abliteration(Modifier[Parameters]):
             winsorization_quantile=self.settings.winsorization_quantile,
         )
 
-        self.residual_directions = F.normalize(
-            bad_means - good_means,
-            p=2,
-            dim=1,
-        )
+        self.residual_directions = normalize(bad_means - good_means, axis=1)
 
         if self.settings.orthogonalize_direction:
             # Implements https://huggingface.co/blog/grimjim/projected-abliteration
             # Adjust the residual directions so that only the component that is
             # orthogonal to the good direction is subtracted during abliteration.
-            good_directions = F.normalize(
-                good_means,
-                p=2,
-                dim=1,
-            )
-            projection_vector = torch.sum(
+            good_directions = normalize(good_means, axis=1)
+            projection_vector = np.sum(
                 self.residual_directions * good_directions,
-                dim=1,
+                axis=1,
             )
             self.residual_directions = (
-                self.residual_directions
-                - projection_vector.unsqueeze(1) * good_directions
+                self.residual_directions - projection_vector[:, None] * good_directions
             )
-            self.residual_directions = F.normalize(
-                self.residual_directions,
-                p=2,
-                dim=1,
-            )
+            self.residual_directions = normalize(self.residual_directions, axis=1)
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -309,28 +434,45 @@ class Abliteration(Modifier[Parameters]):
 
     def modify_model(self, ctx: Context, parameters: Parameters) -> None:
         model = ctx.get_model()
+        layer_count = len(model.get_layers())
 
         if parameters.direction_index is None:
-            residual_direction = None
+            # The index must be shifted by 1 because the first element
+            # of residual_directions is the direction for the embeddings.
+            residual_directions = self.residual_directions[1:]
         else:
             # The index must be shifted by 1 because the first element
             # of residual_directions is the direction for the embeddings.
             weight, index = math.modf(parameters.direction_index + 1)
-            residual_direction = F.normalize(
-                self.residual_directions[int(index)].lerp(
+            residual_direction = normalize(
+                lerp(
+                    self.residual_directions[int(index)],
                     self.residual_directions[int(index) + 1],
                     weight,
                 ),
-                p=2,
-                dim=0,
+                axis=0,
             )
+            # Every layer gets the same direction, so that both direction scopes
+            # share one compiled program.
+            residual_directions = np.broadcast_to(
+                residual_direction,
+                (layer_count, residual_direction.size),
+            )
+
+        # svd_lowrank is randomised. Upstream reseeds immediately before every call
+        # so restoring a trial is independent of RNG history. A key derived from the
+        # seed alone does the same.
+        key = jax.random.fold_in(jax.random.key(self.heretic_settings.seed), 2)
 
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
-        for layer_index in range(len(model.get_layers())):
-            for component, modules in model.get_layer_modules(layer_index).items():
-                weight_distribution = parameters.weight_distributions[component]
+        for component in model.get_abliterable_components():
+            weight_distribution = parameters.weight_distributions[component]
 
+            weights = np.zeros(layer_count, np.float32)
+            apply = np.zeros(layer_count, bool)
+
+            for layer_index in range(layer_count):
                 # Type inference fails here for some reason.
                 distance = cast(
                     float, abs(layer_index - weight_distribution.max_weight_position)
@@ -348,123 +490,25 @@ class Abliteration(Modifier[Parameters]):
                 ) * (weight_distribution.min_weight - weight_distribution.max_weight)
 
                 # A weight of 0 disables this component's ablation. reset_model() has
-                # already left the adapter at identity, so abort before the otherwise
-                # wasteful decomposition (which would also be operating on a zero matrix).
+                # already left the adapter at identity, so skip the otherwise wasteful
+                # decomposition (which would also be operating on a zero matrix).
                 if weight == 0:
                     continue
 
-                if residual_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of residual_directions is the direction for the embeddings.
-                    layer_residual_direction = self.residual_directions[layer_index + 1]
-                else:
-                    layer_residual_direction = residual_direction
+                weights[layer_index] = weight
+                apply[layer_index] = True
 
-                for module in modules:
-                    # FIXME: This cast is potentially invalid, because the program logic
-                    #        does not guarantee that the module is of type Linear, and in fact
-                    #        the retrieved modules might not conform to the interface assumed
-                    #        below (though they do in practice). However, this is difficult
-                    #        to fix cleanly, because get_layer_modules is called twice on
-                    #        different model configurations, and PEFT employs different
-                    #        module types depending on the chosen quantization.
-                    module = cast(Linear, module)
-
-                    # LoRA abliteration: delta W = -lambda * v * (v^T W)
-                    # lora_B = -lambda * v
-                    # lora_A = v^T W
-
-                    # Use the FP32 residual direction directly (no downcast/upcast)
-                    # and move to the correct device.
-                    v = layer_residual_direction.to(module.weight.device)
-
-                    # Get W (dequantize if necessary).
-                    #
-                    # FIXME: This cast is valid only under the assumption that the original
-                    #        module wrapped by the LoRA adapter has a weight attribute.
-                    #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
-
-                    if quant_state is None:
-                        W = base_weight.to(torch.float32)
-                    else:
-                        # 4-bit quantization.
-                        # This cast is always valid. Type inference fails here because the
-                        # bnb.functional module is not found by ty for some reason.
-                        W = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
-                        )
-
-                    # Flatten weight matrix to (out_features, in_features).
-                    W = W.view(W.shape[0], -1)
-
-                    if self.settings.row_normalization == RowNormalization.FULL:
-                        # Keep a reference to the original weight matrix so we can subtract it later.
-                        W_org = W
-
-                    if self.settings.row_normalization != RowNormalization.NONE:
-                        # Get the row norms.
-                        W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
-                        # Normalize the weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
-
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
-                    lora_B = (-weight * v).view(-1, 1)
-
-                    if self.settings.row_normalization == RowNormalization.PRE:
-                        # Make the LoRA adapter apply to the original weight matrix.
-                        lora_B = W_row_norms * lora_B
-                    elif self.settings.row_normalization == RowNormalization.FULL:
-                        # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-                        W = W + lora_B @ lora_A
-                        # Normalize the adjusted weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-                        # Restore the original row norms of the weight matrix.
-                        W = W * W_row_norms
-                        # Subtract the original matrix to turn W into a delta.
-                        W = W - W_org
-                        # Use a low-rank SVD to get an approximation of the matrix.
-                        r = model.peft_config.r
-
-                        # svd_lowrank is randomized:
-                        # https://github.com/pytorch/pytorch/blob/20919052303c0b5ba87f8bf7e19237dc33ab09d3/torch/_lowrank.py#L108-L109
-                        # Reseed immediately before the call so restoring a trial is independent of RNG history.
-                        torch.manual_seed(self.heretic_settings.seed)
-                        # "It's safe to call this function if CUDA is not available;
-                        # in that case, it is silently ignored."
-                        torch.cuda.manual_seed_all(self.heretic_settings.seed)  # ty:ignore[invalid-argument-type]
-                        U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
-
-                        # Truncate it to the part we want to store in the LoRA adapter.
-                        # Note: svd_lowrank actually returns V, so transpose it to get Vh.
-                        U = U[:, :r]
-                        S = S[:r]
-                        Vh = Vh[:, :r].T
-                        # Transfer it into the LoRA adapter components. Split the singular values
-                        # evenly between the two components to keep their norms balanced and avoid
-                        # potential issues with numerical stability.
-                        sqrt_S = torch.sqrt(S)
-                        lora_B = U @ torch.diag(sqrt_S)
-                        lora_A = torch.diag(sqrt_S) @ Vh
-
-                    # Assign to adapters. The adapter name is "default", because that's
-                    # what PEFT uses when no name is explicitly specified, as above.
-                    # These casts are therefore valid.
-                    weight_A = cast(Tensor, module.lora_A["default"].weight)
-                    weight_B = cast(Tensor, module.lora_B["default"].weight)
-                    weight_A.data = lora_A.to(weight_A.dtype)
-                    weight_B.data = lora_B.to(weight_B.dtype)
+            A_reset, _ = model.get_lora(component)
+            lora_A, lora_B = get_adapters(
+                model.get_base_weights(component),
+                residual_directions,
+                weights,
+                apply,
+                A_reset,
+                key,
+                row_normalization=self.settings.row_normalization,
+            )
+            model.set_lora(component, lora_A, lora_B)
 
     def reset_model(self, ctx: Context) -> None:
         model = ctx.get_model()
