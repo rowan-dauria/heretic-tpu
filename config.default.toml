@@ -1,35 +1,35 @@
 # Rename this file to config.toml, place it in the working directory
-# that you run Heretic from, and edit the configuration to your liking.
+# that you run heretic-tpu from, and edit the configuration to your liking.
 
-# List of PyTorch dtypes to try when loading model tensors.
+# List of dtypes to try when loading model tensors.
 # If loading with a dtype fails, the next dtype in the list will be tried.
+# float16 is not used: "float16" entries, and "auto" for float16 checkpoints,
+# load the model in bfloat16.
 dtypes = [
     # In practice, "auto" almost always means bfloat16.
     "auto",
-    # If that doesn't work (e.g. on pre-Ampere hardware), fall back to float16.
-    "float16",
     # If "auto" resolves to float32, and that fails because it is too large,
-    # and float16 fails due to range issues, try bfloat16.
+    # try bfloat16.
     "bfloat16",
     # If neither of those work, fall back to float32 (which will of course fail
     # if that was the dtype "auto" resolved to).
     "float32",
 ]
 
-# Quantization method to use when loading the model. Options:
-# "none" (no quantization),
-# "bnb_4bit" (4-bit quantization using bitsandbytes).
+# Quantisation method to use when loading the model.
+# Only "none" (no quantisation) is supported, because bitsandbytes
+# quantisation is unavailable on TPU.
 quantization = "none"
 
-# Device map to pass to Accelerate when loading the model.
-device_map = "auto"
-
-# Maximum memory to allocate per device.
-# max_memory = { "0" = "20GB", "cpu" = "64GB" }
+# How to place the model on the local TPU devices. Options:
+# "auto" (a single device if the model fits on one, otherwise "tensor"),
+# "single" (the first local device only),
+# "tensor" (tensor parallelism across all local devices).
+parallelism = "auto"
 
 # Whether to move intermediate analysis tensors (such as residuals and logprobs)
-# to CPU memory as soon as possible to reduce peak VRAM usage.
-# This lowers peak VRAM usage during residual analysis and evaluation,
+# to CPU memory as soon as possible to reduce peak device memory usage.
+# This lowers peak device memory usage during residual analysis and evaluation,
 # but may slightly reduce performance due to host/device transfers.
 offload_outputs_to_cpu = true
 
@@ -96,7 +96,13 @@ n_startup_trials = 30
 # Directory to save and load study progress to/from.
 study_checkpoint_dir = "checkpoints"
 
-# Maximum size for individual safetensors files generated when exporting a model.
+# Directory of the persistent XLA compilation cache, which lets later runs
+# reuse compiled programs instead of compiling them again.
+# An empty string disables the cache.
+compilation_cache_dir = "~/.cache/heretic-tpu/xla"
+
+# Accepted for compatibility with Heretic, but ignored:
+# exported models keep the shard layout of the original model.
 max_shard_size = "5GB"
 
 # System prompt to use when prompting the model.

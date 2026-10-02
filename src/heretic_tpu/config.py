@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import os
 from enum import Enum
-from typing import Dict, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from pydantic import (
     BaseModel,
@@ -10,6 +11,7 @@ from pydantic import (
     NonNegativeInt,
     PositiveInt,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import (
     BaseSettings,
@@ -29,7 +31,13 @@ from pydantic_settings import (
 
 class QuantizationMethod(str, Enum):
     NONE = "none"
-    BNB_4BIT = "bnb_4bit"
+
+
+# Settings of upstream Heretic that configure Accelerate's model placement,
+# which heretic-tpu doesn't use. They are still found in settings restored from
+# upstream runs (config.toml, reproduce.json, study checkpoints), which must
+# remain loadable, so they are ignored with a warning instead of being rejected.
+UNSUPPORTED_UPSTREAM_SETTINGS = ["device_map", "max_memory"]
 
 
 class ExportStrategy(str, Enum):
@@ -230,46 +238,46 @@ class Settings(BaseSettings):
         default=[
             # In practice, "auto" almost always means bfloat16.
             "auto",
-            # If that doesn't work (e.g. on pre-Ampere hardware), fall back to float16.
-            "float16",
             # If "auto" resolves to float32, and that fails because it is too large,
-            # and float16 fails due to range issues, try bfloat16.
+            # try bfloat16.
             "bfloat16",
             # If neither of those work, fall back to float32 (which will of course fail
             # if that was the dtype "auto" resolved to).
             "float32",
         ],
         description=(
-            "List of PyTorch dtypes to try when loading model tensors. "
-            "If loading with a dtype fails, the next dtype in the list will be tried."
+            "List of dtypes to try when loading model tensors. "
+            "If loading with a dtype fails, the next dtype in the list will be tried. "
+            'float16 is not used: "float16" entries, and "auto" for float16 checkpoints, '
+            "load the model in bfloat16."
         ),
     )
 
     quantization: QuantizationMethod = Field(
         default=QuantizationMethod.NONE,
         description=(
-            "Quantization method to use when loading the model. Options: "
-            '"none" (no quantization), '
-            '"bnb_4bit" (4-bit quantization using bitsandbytes).'
+            "Quantisation method to use when loading the model. "
+            'Only "none" (no quantisation) is supported, because bitsandbytes '
+            "quantisation is unavailable on TPU."
         ),
     )
 
-    device_map: str | Dict[str, int | str] = Field(
+    parallelism: Literal["auto", "single", "tensor"] = Field(
         default="auto",
-        description="Device map to pass to Accelerate when loading the model.",
-    )
-
-    max_memory: Dict[str, str] | None = Field(
-        default=None,
-        description='Maximum memory to allocate per device (e.g., { "0" = "20GB", "cpu" = "64GB" }).',
+        description=(
+            "How to place the model on the local TPU devices. Options: "
+            '"auto" (a single device if the model fits on one, otherwise "tensor"), '
+            '"single" (the first local device only), '
+            '"tensor" (tensor parallelism across all local devices).'
+        ),
     )
 
     offload_outputs_to_cpu: bool = Field(
         default=True,
         description=(
             "Whether to move intermediate analysis tensors (such as residuals and logprobs) "
-            "to CPU memory as soon as possible to reduce peak VRAM usage. "
-            "This lowers peak VRAM usage during residual analysis and evaluation, "
+            "to CPU memory as soon as possible to reduce peak device memory usage. "
+            "This lowers peak device memory usage during residual analysis and evaluation, "
             "but may slightly reduce performance due to host/device transfers."
         ),
     )
@@ -417,13 +425,25 @@ class Settings(BaseSettings):
         default=None,
         description=(
             "Random seed for reproducible optimization. "
-            "Applies to Python's random module, NumPy, PyTorch, and Optuna."
+            "Applies to Python's random module, NumPy, JAX, and Optuna."
         ),
     )
 
     study_checkpoint_dir: str = Field(
         default="checkpoints",
         description="Directory to save and load study progress to/from.",
+        exclude=True,
+    )
+
+    compilation_cache_dir: str = Field(
+        default="~/.cache/heretic-tpu/xla",
+        description=(
+            "Directory of the persistent XLA compilation cache, which lets later runs "
+            "reuse compiled programs instead of compiling them again. "
+            "An empty string disables the cache."
+        ),
+        # The default contains "~", which must be expanded too.
+        validate_default=True,
         exclude=True,
     )
 
@@ -491,7 +511,10 @@ class Settings(BaseSettings):
 
     max_shard_size: PositiveInt | str = Field(
         default="5GB",
-        description="Maximum size for individual safetensors files generated when exporting a model.",
+        description=(
+            "Accepted for compatibility with Heretic, but ignored: "
+            "exported models keep the shard layout of the original model."
+        ),
     )
 
     export_strategy: ExportStrategy | None = Field(
@@ -550,6 +573,51 @@ class Settings(BaseSettings):
         default="You are a helpful assistant.",
         description="System prompt to use when prompting the model.",
     )
+
+    @field_validator("quantization", mode="before")
+    @classmethod
+    def validate_quantization(cls, value: Any) -> Any:
+        # Upstream Heretic also offers 4-bit quantisation with bitsandbytes,
+        # so explain why that option is missing instead of only listing the valid ones.
+        if value == "bnb_4bit":
+            raise ValueError(
+                '"bnb_4bit" is not supported: bitsandbytes quantisation requires CUDA '
+                'and is unavailable on TPU. Use "none".'
+            )
+
+        return value
+
+    @field_validator("compilation_cache_dir")
+    @classmethod
+    def expand_compilation_cache_dir(cls, value: str) -> str:
+        # Values from configuration files and the environment don't pass through
+        # a shell that would expand "~".
+        return os.path.expanduser(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_unsupported_upstream_settings(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        unsupported = [key for key in UNSUPPORTED_UPSTREAM_SETTINGS if key in data]
+
+        if unsupported:
+            # Imported here because utils imports this module.
+            from .utils import print
+
+            print(
+                "[yellow]Warning: Ignoring "
+                + " and ".join(f"[bold]{key}[/]" for key in unsupported)
+                + ", which heretic-tpu does not support. "
+                "Model placement is controlled by the [bold]parallelism[/] setting.[/]"
+            )
+
+            # Removing the keys also keeps them out of model_extra,
+            # so they are not written back when the settings are stored.
+            data = {key: value for key, value in data.items() if key not in unsupported}
+
+        return data
 
     # We intentionally allow extra keys so users can provide plugin-specific
     # configuration in TOML tables like `[scorer.KeywordRate]` which are later
