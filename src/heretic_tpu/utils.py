@@ -10,14 +10,14 @@ import platform
 import tempfile
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import huggingface_hub
+import jax
 import tomli_w
-import torch
 from datasets import DatasetDict, ReadInstruction, load_dataset, load_from_disk
 from datasets.config import DATASET_STATE_JSON_FILENAME
 from datasets.download.download_manager import DownloadMode
@@ -35,9 +35,10 @@ from .system import (
     get_accelerator_info_dict,
     get_cpu_info_dict,
     get_heretic_version_info,
+    get_libtpu_version,
+    get_package_version,
     get_python_env_info_dict,
     get_requirements_dict,
-    is_xpu_available,
 )
 
 if TYPE_CHECKING:
@@ -81,21 +82,22 @@ def print_memory_usage():
 
     p("Resident system RAM", Process().memory_info().rss)
 
-    if torch.cuda.is_available():
-        count = torch.cuda.device_count()
-        allocated = sum(torch.cuda.memory_allocated(device) for device in range(count))
-        reserved = sum(torch.cuda.memory_reserved(device) for device in range(count))
-        p("Allocated GPU VRAM", allocated)
-        p("Reserved GPU VRAM", reserved)
-    elif is_xpu_available():
-        count = torch.xpu.device_count()
-        allocated = sum(torch.xpu.memory_allocated(device) for device in range(count))
-        reserved = sum(torch.xpu.memory_reserved(device) for device in range(count))
-        p("Allocated XPU memory", allocated)
-        p("Reserved XPU memory", reserved)
-    elif torch.backends.mps.is_available():
-        p("Allocated MPS memory", torch.mps.current_allocated_memory())
-        p("Driver (reserved) MPS memory", torch.mps.driver_allocated_memory())
+    # The CPU backend reports no memory statistics.
+    memory_stats = [
+        stats
+        for stats in (device.memory_stats() for device in jax.local_devices())
+        if stats is not None
+    ]
+
+    if memory_stats:
+        p(
+            "Allocated device memory",
+            sum(stats.get("bytes_in_use", 0) for stats in memory_stats),
+        )
+        p(
+            "Peak allocated device memory",
+            sum(stats.get("peak_bytes_in_use", 0) for stats in memory_stats),
+        )
 
 
 def format_duration(seconds: float) -> str:
@@ -201,7 +203,7 @@ def _load_prompts_single(
             if specification.commit is None:
                 try:
                     specification.commit = huggingface_hub.dataset_info(path).sha
-                except Exception as error:
+                except Exception as error:  # noqa: BLE001
                     # Fetching the commit hash requires internet access, but the
                     # dataset itself may be fully cached locally. Proceed without
                     # pinning; an unpinned dataset disables the reproducibility
@@ -303,6 +305,29 @@ def batchify(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
+def get_upstream_plugin_name(name: str) -> str:
+    """
+    Maps the import path of a plugin that ships with heretic-tpu to the path
+    of the same plugin in upstream Heretic, which heretic-tpu also accepts.
+    """
+    if name.startswith("heretic_tpu."):
+        return "heretic." + name.removeprefix("heretic_tpu.")
+    return name
+
+
+def dump_settings(settings: Settings, exclude_none: bool = False) -> dict[str, Any]:
+    """
+    Serialises the settings with built-in plugins named as in upstream Heretic,
+    so that both programs can read the stored settings.
+    """
+    data = settings.model_dump(exclude_none=exclude_none)
+
+    for plugin_config in [*data["scorers"], *data["modifiers"]]:
+        plugin_config["plugin"] = get_upstream_plugin_name(plugin_config["plugin"])
+
+    return data
+
+
 def get_readme_intro(
     settings: Settings,
     modifier: Modifier[Any],
@@ -344,9 +369,9 @@ def get_readme_intro(
     else:
         reproducibility_instructions = ""
 
-    return f"""# This is a decensored version of {
-        model_link
-    }, made using [Heretic](https://heretic-project.org) v{version("heretic-llm")}
+    return f"""# This is a decensored version of {model_link}, made using heretic-tpu v{
+        version("heretic-tpu")
+    }, a TPU port of [Heretic](https://heretic-project.org)
 {reproducibility_instructions}
 ## {modifier.modifier_name} parameters
 
@@ -375,7 +400,7 @@ def get_readme_intro(
 def generate_config_toml(settings: Settings) -> str:
     """Serializes the full Settings object to TOML."""
 
-    return tomli_w.dumps(settings.model_dump(exclude_none=True))
+    return tomli_w.dumps(dump_settings(settings, exclude_none=True))
 
 
 def generate_requirements_txt() -> str:
@@ -415,33 +440,32 @@ def generate_reproduce_readme(
     heterogeneous_warning = ""
 
     if include_system_information:
-        if torch.cuda.is_available():
-            count = torch.cuda.device_count()
-            if count > 1:
-                device_names = {torch.cuda.get_device_name(i) for i in range(count)}
-                if len(device_names) > 1:
-                    heterogeneous_warning = """
-> [!WARNING]
-> **Heterogeneous GPUs**
->
-> This model was generated using multiple non-identical GPUs. When operations are distributed across different GPUs
-> (e.g. via `device_map='auto'`), non-deterministic behavior can occur.
->
-> Reproducibility *cannot* be guaranteed in this environment.
-"""
-
         cpu = get_cpu_info_dict()
         python_env = get_python_env_info_dict()
 
         accelerators = get_accelerator_info_dict()
         if accelerators["type"] is None:
-            accelerator_report = "**No GPU or other accelerator detected.**"
+            accelerator_report = "**No TPU or other accelerator detected.**"
         else:
             devices = accelerators["devices"]
-            total_vram = sum(device.get("vram_gb", 0) for device in devices)
-            vram_suffix = f" ({total_vram:.2f} GB total VRAM)" if total_vram > 0 else ""
+
+            if len({device["name"] for device in devices}) > 1:
+                heterogeneous_warning = """
+> [!WARNING]
+> **Heterogeneous accelerators**
+>
+> This model was generated using multiple non-identical accelerators. When operations are distributed across different devices
+> (e.g. via tensor parallelism), non-deterministic behaviour can occur.
+>
+> Reproducibility *cannot* be guaranteed in this environment.
+"""
+
+            total_memory = sum(device.get("vram_gb", 0) for device in devices)
+            memory_suffix = (
+                f" ({total_memory:.2f} GB total HBM)" if total_memory > 0 else ""
+            )
             accelerator_lines = [
-                f"- **{accelerators['type']}:** Detected {len(devices)} device(s){vram_suffix}"
+                f"- **{accelerators['type']}:** Detected {len(devices)} device(s){memory_suffix}"
             ]
 
             if accelerators.get("api_name") and accelerators.get("api_version"):
@@ -456,9 +480,13 @@ def generate_reproduce_readme(
 
             accelerator_lines.append("- **Devices:**")
             for i, device in enumerate(devices):
-                vram = f" ({device['vram_gb']:.2f} GB)" if device.get("vram_gb") else ""
+                memory = (
+                    f" ({device['vram_gb']:.2f} GB HBM)"
+                    if device.get("vram_gb")
+                    else ""
+                )
                 accelerator_lines.append(
-                    f"  - **{accelerators['type']} {i}:** {device['name']}{vram}"
+                    f"  - **{accelerators['type']} {i}:** {device['name']}{memory}"
                 )
             accelerator_report = "\n".join(accelerator_lines)
 
@@ -490,16 +518,16 @@ def generate_reproduce_readme(
 > [!IMPORTANT]
 > **Git installation**
 >
-> This system installed Heretic from a Git repository: {repo_info}
+> This system installed heretic-tpu from a Git repository: {repo_info}
 >
-> To reproduce the model, you must install Heretic from this exact repository and commit.
+> To reproduce the model, you must install heretic-tpu from this exact repository and commit.
 """
         elif version_info.origin == "Local":
             origin_warning = """
 > [!WARNING]
 > **Local code**
 >
-> This system installed Heretic from a local directory or wheel. Uncommitted or experimental code may have been executed.
+> This system installed heretic-tpu from a local directory or wheel. Uncommitted or experimental code may have been executed.
 >
 > Reproducibility *cannot* be guaranteed in this environment.
 """
@@ -508,19 +536,12 @@ def generate_reproduce_readme(
 > [!WARNING]
 > **Non-standard installation**
 >
-> This system installed Heretic from an unknown non-standard source.
+> This system installed heretic-tpu from an unknown non-standard source.
 >
 > Reproducibility *cannot* be guaranteed in this environment.
 """
 
-    pytorch_version = torch.__version__
-    pytorch_install_command = f"pip install torch=={pytorch_version}"
-    if "+" in pytorch_version:
-        suffix = pytorch_version.split("+")[1]
-        if suffix:
-            pytorch_install_command += (
-                f" --index-url https://download.pytorch.org/whl/{suffix}"
-            )
+    libtpu_version = get_libtpu_version()
 
     formatted_datasets = set()
     for specification in dataset_specifications:
@@ -556,7 +577,7 @@ def generate_reproduce_readme(
 
     return f"""# Reproduction guide
 
-This directory contains the necessary information and assets to reproduce the results obtained during this Heretic run.{heterogeneous_warning}{origin_warning}
+This directory contains the necessary information and assets to reproduce the results obtained during this heretic-tpu run.{heterogeneous_warning}{origin_warning}
 
 ## Models
 
@@ -573,8 +594,10 @@ This directory contains the necessary information and assets to reproduce the re
 
 {system_report}## Environment
 
-- **Heretic:** v{version_info.version}{f" (Origin: {version_info.origin})" if version_info.origin else ""}
-- **PyTorch:** {pytorch_version}
+- **heretic-tpu:** v{version_info.version}{f" (Origin: {version_info.origin})" if version_info.origin else ""}
+- **JAX:** {get_package_version("jax")}
+- **jaxlib:** {get_package_version("jaxlib")}
+- **libtpu:** {libtpu_version or "not installed"}
 - **Other dependencies:** See [`requirements.txt`](requirements.txt).
 
 ## Contents of this directory
@@ -589,19 +612,18 @@ This directory contains the necessary information and assets to reproduce the re
 
 > [!TIP]
 > You can automate this process, including all verification steps, by downloading the `reproduce.json` file and running
-> `heretic --reproduce reproduce.json`.
+> `heretic-tpu --reproduce reproduce.json`.
 
-{system_instructions}1. Install the exact version of Heretic indicated in the **Environment** section above, from its original source.
-1. Install the packages listed in `requirements.txt`: `pip install -r requirements.txt`
-1. Install the correct version of PyTorch: `{pytorch_install_command}`
+{system_instructions}1. Install the exact version of heretic-tpu indicated in the **Environment** section above, from its original source.
+1. Install the packages listed in `requirements.txt`, which pins the exact versions of JAX, jaxlib and (on TPU) libtpu: `pip install -r requirements.txt`
 1. Place the provided `config.toml` in your working directory.
-1. Run Heretic without any additional arguments: `heretic`
+1. Run heretic-tpu without any additional arguments: `heretic-tpu`
 1. Wait for the run to finish, then select trial **{trial.user_attrs["index"]}** and export the model.
 1. Verify that the weight files have been exactly reproduced by comparing their SHA-256 hashes against those in `SHA256SUMS`:
    `sha256sum -c SHA256SUMS` (or look at the hashes online if you uploaded to Hugging Face)
 
 > [!TIP]
-> To use the included Optuna study journal `{checkpoint_filename}`, place it in the checkpoints directory (usually `checkpoints/`) before running Heretic.
+> To use the included Optuna study journal `{checkpoint_filename}`, place it in the checkpoints directory (usually `checkpoints/`) before running heretic-tpu.
 >
 > This allows you to export other models from the Pareto front, or to run additional trials without having to re-run the stored trials.
 """
@@ -624,15 +646,22 @@ def generate_reproduce_json(
         "timestamp": timestamp,
         "system": None,  # Defined here to preserve insertion order.
         "environment": {
+            # Upstream Heretic's reader requires the "heretic" and "pytorch_version" keys,
+            # so heretic-tpu stores its own version information under "heretic" and
+            # leaves "pytorch_version" empty. "backend" tells the two programs' files apart.
             "heretic": {
                 "version": version_info.version,
                 "is_standard_pypi": version_info.is_standard_pypi,
                 "metadata": version_info.metadata,
             },
-            "pytorch_version": torch.__version__,
+            "pytorch_version": None,
+            "backend": "jax",
+            "jax_version": get_package_version("jax"),
+            "jaxlib_version": get_package_version("jaxlib"),
+            "libtpu_version": get_libtpu_version(),
             "requirements": get_requirements_dict(),
         },
-        "settings": settings.model_dump(),
+        "settings": dump_settings(settings),
         "parameters": trial.user_attrs["parameters"],
         "scores": trial.user_attrs["scores"],
         "hashes": uploaded_model_hashes,
@@ -696,9 +725,7 @@ def create_reproduce_folder(
     settings.model_commit = huggingface_hub.model_info(settings.model).sha
 
     # Strip microseconds and timezone for a clean format.
-    timestamp = (
-        datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None).isoformat()
-    )
+    timestamp = datetime.now(UTC).replace(microsecond=0, tzinfo=None).isoformat()
 
     (reproduce_dir / "requirements.txt").write_text(
         generate_requirements_txt(),

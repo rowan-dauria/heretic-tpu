@@ -13,7 +13,6 @@ from urllib.request import urlopen
 
 import cpuinfo
 import questionary
-import torch
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import (
     GatedRepoError,
@@ -151,9 +150,13 @@ class MismatchSeverity(IntEnum):
 def get_package_mismatch_severity(package_name: str) -> MismatchSeverity:
     if package_name in [
         "heretic-llm",
+        "heretic-tpu",
     ]:
         return MismatchSeverity.CRITICAL
     elif package_name in [
+        "jax",
+        "jaxlib",
+        "libtpu",
         "torch",
         "transformers",
     ]:
@@ -285,27 +288,32 @@ def check_environment(
 
     else:
         print(
-            (
-                "[yellow]The provided JSON file does not contain system information. "
-                "Some system parameters can affect reproducibility, but due to the lack of system information, "
-                "Heretic is unable to verify that those parameters match the original environment. "
-                "Reproduction may or may not produce a byte-for-byte identical model.[/]"
-            )
+            "[yellow]The provided JSON file does not contain system information. "
+            "Some system parameters can affect reproducibility, but due to the lack of system information, "
+            "heretic-tpu is unable to verify that those parameters match the original environment. "
+            "Reproduction may or may not produce a byte-for-byte identical model.[/]"
         )
 
     requirements = get_requirements_dict()
-    requirements["heretic-llm"] = format_version_information(
+    requirements["heretic-tpu"] = format_version_information(
         asdict(get_heretic_version_info())
     )
-    requirements["torch"] = torch.__version__
 
-    original_requirements = reproduction_information["environment"]["requirements"]
-    original_requirements["heretic-llm"] = format_version_information(
-        reproduction_information["environment"]["heretic"]
-    )
-    original_requirements["torch"] = reproduction_information["environment"][
-        "pytorch_version"
-    ]
+    environment = reproduction_information["environment"]
+    original_requirements = environment["requirements"]
+
+    if environment.get("backend") == "jax":
+        original_requirements["heretic-tpu"] = format_version_information(
+            environment["heretic"]
+        )
+    else:
+        # The file was written by upstream Heretic, which records its own version
+        # and the PyTorch version. Comparing them under their own names makes them
+        # show up as mismatches, because this system runs neither.
+        original_requirements["heretic-llm"] = format_version_information(
+            environment["heretic"]
+        )
+        original_requirements["torch"] = environment["pytorch_version"]
 
     package_names = sorted(requirements.keys() | original_requirements.keys())
 
@@ -321,10 +329,8 @@ def check_environment(
     if system_mismatches or package_mismatches:
         print()
         print(
-            (
-                "[yellow]Your local environment doesn't perfectly match the environment "
-                "used to produce the original model. The following components differ:[/]"
-            )
+            "[yellow]Your local environment doesn't perfectly match the environment "
+            "used to produce the original model. The following components differ:[/]"
         )
 
     if system_mismatches:
@@ -358,12 +364,10 @@ def check_environment(
     if system_mismatches or package_mismatches:
         print()
         print(
-            (
-                f"There is a {cast(MismatchSeverity, mismatch_severity).__rich__()} chance "
-                "that reproduction won't produce a byte-for-byte identical model. "
-                "However, the resulting model will very likely still behave similarly "
-                "to the original model."
-            )
+            f"There is a {cast(MismatchSeverity, mismatch_severity).__rich__()} chance "
+            "that reproduction won't produce a byte-for-byte identical model. "
+            "However, the resulting model will very likely still behave similarly "
+            "to the original model."
         )
 
         if settings.ignore_mismatches is None:

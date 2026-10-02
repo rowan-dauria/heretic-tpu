@@ -7,147 +7,33 @@ import json
 import os
 import platform
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any
 
 import cpuinfo
-import torch
-from accelerate.utils import (
-    is_mlu_available,
-    is_musa_available,
-    is_npu_available,
-    is_sdaa_available,
-    is_xpu_available,
-)
+import jax
 
 
 def empty_cache():
-    """Clears the backend cache and collects garbage."""
+    """Collects garbage, so that device buffers that are no longer referenced are freed."""
 
-    # Collecting garbage is not an idempotent operation, and to avoid OOM errors,
-    # gc.collect() has to be called both before and after emptying the backend cache.
-    # See https://github.com/p-e-w/heretic/pull/17 for details.
-    gc.collect()
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    elif is_xpu_available():
-        torch.xpu.empty_cache()
-    elif is_mlu_available():
-        torch.mlu.empty_cache()  # ty:ignore[unresolved-attribute]
-    elif is_sdaa_available():
-        torch.sdaa.empty_cache()  # ty:ignore[unresolved-attribute]
-    elif is_musa_available():
-        torch.musa.empty_cache()  # ty:ignore[unresolved-attribute]
-    elif torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-
+    # JAX frees an array's device memory as soon as the last reference to it dies,
+    # and there is no allocator cache to empty, so collecting reference cycles
+    # is all that is needed.
     gc.collect()
 
 
-def get_nvidia_driver_version() -> str | None:
-    """Gets the NVIDIA driver version using nvidia-smi."""
+def configure_compilation_cache(directory: str):
+    """
+    Enables JAX's persistent compilation cache in the given directory,
+    or disables it if the directory is empty.
 
-    try:
-        output = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        return output.strip().split("\n")[0]
-    except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
-        return None
+    Must be called before anything is compiled, because JAX sets up the cache
+    when it compiles for the first time.
+    """
 
-
-def get_amdgpu_driver_version() -> str | None:
-    """Gets the AMD GPU (ROCm) driver and suite version info."""
-
-    # 1. Try amd-smi (modern standard for ROCm 6.0+)
-    try:
-        output = subprocess.check_output(
-            ["amd-smi", "version"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        if output.strip():
-            return output.strip().replace("\n", " | ")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-
-    # 2. Try rocm-smi --showdriverversion
-    try:
-        output = subprocess.check_output(
-            ["rocm-smi", "--showdriverversion"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        for line in output.split("\n"):
-            if "Driver version" in line:
-                return line.split(":")[-1].strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-
-    # 3. Try /sys/module/amdgpu/version (Linux kernel driver version)
-    try:
-        if platform.system() == "Linux":
-            version_path = "/sys/module/amdgpu/version"
-            if os.path.exists(version_path):
-                with open(version_path, "r", encoding="utf-8") as f:
-                    return f.read().strip()
-    except Exception:
-        pass
-
-    return None
-
-
-def get_xpu_driver_version() -> str | None:
-    """Gets the Intel XPU driver version."""
-
-    try:
-        output = subprocess.check_output(
-            ["xpu-smi", "discovery"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        for line in output.split("\n"):
-            if "Driver Version" in line:
-                return line.split(":")[-1].strip()
-        return None
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-
-
-def get_npu_driver_version() -> str | None:
-    """Gets the Huawei NPU driver version."""
-
-    try:
-        output = subprocess.check_output(
-            ["npu-smi", "info", "-t", "board", "-i", "0"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        for line in output.split("\n"):
-            if "Software Version" in line:
-                return line.split()[-1].strip()
-        return None
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-
-
-def get_mps_driver_version() -> str | None:
-    """Gets the Apple Silicon (MPS) driver version via macOS version."""
-
-    try:
-        output = subprocess.check_output(
-            ["sw_vers", "-productVersion"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        return output.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
+    jax.config.update("jax_compilation_cache_dir", directory or None)
 
 
 @dataclass
@@ -172,7 +58,8 @@ def get_heretic_version_info() -> HereticVersionInfo:
 
     try:
         direct_url_content = distribution.read_text("direct_url.json")
-    except Exception:
+    # Unreadable installation metadata only means that the origin is unknown.
+    except Exception:  # noqa: BLE001
         direct_url_content = None
 
     if not direct_url_content:
@@ -237,91 +124,53 @@ def get_heretic_version_info() -> HereticVersionInfo:
     )
 
 
+def get_libtpu_version() -> str | None:
+    """Gets the installed libtpu version, or None if libtpu is not installed."""
+
+    try:
+        return get_package_version("libtpu")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
 def get_accelerator_info_dict() -> dict[str, Any]:
-    """Retrieves raw accelerator info (CUDA, ROCm, etc) directly into structured keys."""
+    """Retrieves raw info about the local JAX devices (TPU, etc) directly into structured keys."""
 
-    if torch.cuda.is_available():
-        count = torch.cuda.device_count()
-        is_rocm = getattr(torch.version, "hip", None) is not None
+    backend = jax.default_backend()
 
-        # ROCm (AMD) and CUDA (NVIDIA) share the same API in PyTorch.
-        # We distinguish them by checking for the HIP version.
-        info: dict[str, Any] = {
-            "type": "ROCm" if is_rocm else "CUDA",
-            "api_name": "HIP Version" if is_rocm else "CUDA Version",
-            "api_version": torch.version.hip if is_rocm else torch.version.cuda,  # ty:ignore[unresolved-attribute]
-            "driver_version": get_amdgpu_driver_version()
-            if is_rocm
-            else get_nvidia_driver_version(),
-            "devices": [],
-        }
+    if backend == "cpu":
+        return {"type": None}
 
-        for i in range(count):
-            name = torch.cuda.get_device_name(i)
-            vram = torch.cuda.mem_get_info(i)[1] / (1024**3)
-            info["devices"].append({"name": name, "vram_gb": round(vram, 2)})
+    devices = []
 
-        return info
+    for device in jax.local_devices():
+        device_info: dict[str, Any] = {"name": device.device_kind}
 
-    if is_xpu_available():
-        count = torch.xpu.device_count()  # ty:ignore[unresolved-attribute]
+        # Not every platform reports memory statistics.
+        memory_stats = device.memory_stats()
+        if memory_stats is not None and "bytes_limit" in memory_stats:
+            device_info["vram_gb"] = round(memory_stats["bytes_limit"] / (1024**3), 2)
+
+        devices.append(device_info)
+
+    # The keys are those of upstream Heretic, whose reproduce.json reader uses them.
+    # JAX exposes no driver versions.
+    if backend == "tpu":
         return {
-            "type": "XPU",
-            "api_name": None,
-            "api_version": None,
-            "driver_version": get_xpu_driver_version(),
-            "devices": [{"name": torch.xpu.get_device_name(i)} for i in range(count)],  # ty:ignore[unresolved-attribute]
-        }
-
-    if is_mlu_available():
-        count = torch.mlu.device_count()  # ty:ignore[unresolved-attribute]
-        return {
-            "type": "MLU",
-            "api_name": None,
-            "api_version": None,
+            "type": "TPU",
+            "api_name": "libtpu",
+            "api_version": get_libtpu_version(),
             "driver_version": None,
-            "devices": [{"name": torch.mlu.get_device_name(i)} for i in range(count)],  # ty:ignore[unresolved-attribute]
+            "devices": devices,
         }
 
-    if is_sdaa_available():
-        count = torch.sdaa.device_count()  # ty:ignore[unresolved-attribute]
-        return {
-            "type": "SDAA",
-            "api_name": None,
-            "api_version": None,
-            "driver_version": None,
-            "devices": [{"name": torch.sdaa.get_device_name(i)} for i in range(count)],  # ty:ignore[unresolved-attribute]
-        }
-
-    if is_musa_available():
-        count = torch.musa.device_count()  # ty:ignore[unresolved-attribute]
-        return {
-            "type": "MUSA",
-            "api_name": None,
-            "api_version": None,
-            "driver_version": None,
-            "devices": [{"name": torch.musa.get_device_name(i)} for i in range(count)],  # ty:ignore[unresolved-attribute]
-        }
-
-    if is_npu_available():
-        return {
-            "type": "NPU",
-            "api_name": "CANN Version",
-            "api_version": torch.version.cann,  # ty:ignore[unresolved-attribute]
-            "driver_version": get_npu_driver_version(),
-            "devices": [],  # Multi-NPU is less common.
-        }
-
-    if torch.backends.mps.is_available():
-        return {
-            "type": "MPS",
-            "api_name": None,
-            "api_version": None,
-            "driver_version": get_mps_driver_version(),
-            "devices": [{"name": "Apple Metal"}],
-        }
-
-    return {"type": None}
+    return {
+        "type": backend.upper(),
+        "api_name": None,
+        "api_version": None,
+        "driver_version": None,
+        "devices": devices,
+    }
 
 
 def get_accelerator_info(include_warnings: bool = True) -> str:
@@ -331,26 +180,22 @@ def get_accelerator_info(include_warnings: bool = True) -> str:
 
     if info["type"] is None:
         suffix = " Operations will be slow." if include_warnings else ""
-        return (
-            f"[bold yellow]No GPU or other accelerator detected.{suffix}[/]\n".strip()
-        )
+        return f"[bold yellow]No TPU or other accelerator detected.{suffix}[/]"
 
     devices = info["devices"]
-    count = len(devices)
-    total_vram = sum(d.get("vram_gb", 0) for d in devices)
+    total_memory = sum(device.get("vram_gb", 0) for device in devices)
 
-    vram_suffix = f" ({total_vram:.2f} GB total VRAM)" if total_vram > 0 else ""
-    report = f"Detected [bold]{count or 1}[/] {info['type']} device(s){vram_suffix}\n"
+    memory_suffix = f" ({total_memory:.2f} GB total HBM)" if total_memory > 0 else ""
+    report = (
+        f"Detected [bold]{len(devices)}[/] {info['type']} device(s){memory_suffix}\n"
+    )
 
-    if info.get("api_name") and info.get("api_version"):
+    if info["api_name"] and info["api_version"]:
         report += f"{info['api_name']}: [bold]{info['api_version']}[/]\n"
 
-    driver = info.get("driver_version") or "Unknown"
-    report += f"Driver Version: [bold]{driver}[/]\n"
-
-    for i, dev in enumerate(devices):
-        vram = f" ({dev['vram_gb']:.2f} GB)" if dev.get("vram_gb") else ""
-        report += f"* {info['type']} {i}: [bold]{dev['name']}[/]{vram}\n"
+    for i, device in enumerate(devices):
+        memory = f" ({device['vram_gb']:.2f} GB HBM)" if device.get("vram_gb") else ""
+        report += f"* {info['type']} {i}: [bold]{device['name']}[/]{memory}\n"
 
     return report.strip()
 
@@ -423,10 +268,11 @@ def get_package_version(name: str) -> str:
 def get_requirements_dict() -> dict[str, str]:
     """Recursively finds all direct and transitive dependencies of heretic-tpu and core libraries."""
 
-    # We start with heretic-llm and the core compute libraries.
-    # PyTorch is not listed as a dependency in the heretic-llm package
-    # because installation is hardware-specific and must be done manually.
-    packages_to_check = ["heretic-tpu", "torch", "torchaudio", "torchvision"]
+    # We start with heretic-tpu and the core compute libraries.
+    # libtpu is a dependency of jax only through its "tpu" extra, which the walk
+    # below skips, so it must be listed explicitly. Packages that are not installed
+    # (such as libtpu on machines without a TPU) are skipped.
+    packages_to_check = ["heretic-tpu", "jax", "jaxlib", "libtpu"]
 
     visited = set()
     required_packages = set()
@@ -467,7 +313,7 @@ def get_requirements_dict() -> dict[str, str]:
     version_info = get_heretic_version_info()
 
     for package in required_packages_sorted:
-        # If heretic-llm was installed from source (Git/Local), exclude it
+        # If heretic-tpu was installed from source (Git/Local), exclude it
         # from requirements.txt to prevent pip from downloading an unrelated
         # version from PyPI during reproduction.
         if package == "heretic-tpu" and not version_info.is_standard_pypi:
