@@ -21,7 +21,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-09-24T17:35:03.054263Z"
+exclude-newer = "2026-09-25T07:19:17.831411Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -790,7 +790,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = "~=2.13" },
     { name = "questionary", specifier = "~=2.1" },
     { name = "rich", specifier = "~=14.3" },
-    { name = "safetensors", specifier = ">=0.6" },
+    { name = "safetensors", specifier = ">=0.8" },
     { name = "tomli-w", specifier = "~=1.2" },
     { name = "tqdm", specifier = "~=4.67" },
     { name = "transformers", specifier = "~=5.6" },

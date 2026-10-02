@@ -33,7 +33,7 @@ dependencies = [
     "pydantic-settings~=2.13",
     "questionary~=2.1",
     "rich~=14.3",
-    "safetensors>=0.6",
+    "safetensors>=0.8",
     "tomli-w~=1.2",
     "tqdm~=4.67",
     # Only tokenizers, configs and chat templates are used; PyTorch is not required.
