@@ -29,6 +29,31 @@ LAYERS = 16
 # Bound on the bytes of an output tuple's index table, which is never aliased.
 TUPLE_BYTES = 128
 
+# Attention shapes, with the cache lengths to compile at: the narrow heads of the
+# synthetic architecture, and heads as wide as those of real models (TPU layouts pad
+# narrow heads, and XLA:TPU chooses the cache layout by head shape).
+HEADS = {
+    "narrow": ({}, (4096, 8192)),
+    "wide": (
+        {
+            "hidden_size": 512,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rope": (
+                RopeSpec(
+                    rope_type="default",
+                    rot=128,
+                    params=(("rope_theta", 10000.0), ("rope_type", "default")),
+                ),
+            )
+            * LAYERS,
+        },
+        # Cache lengths that are not multiples of 8, as with real prompts.
+        (1028, 2052),
+    ),
+}
+
 
 def _engine(**changes: Any) -> Engine:
     arch = synthetic_arch(**{"num_hidden_layers": LAYERS, **changes})
@@ -78,18 +103,23 @@ def _state_bytes(eng: Engine, max_new_tokens: int) -> int:
     )
 
 
+@pytest.mark.parametrize("heads", sorted(HEADS))
 @pytest.mark.parametrize("sampling", [False, True])
-def test_kv_cache_is_built_once_and_updated_in_place(sampling: bool) -> None:
+def test_kv_cache_is_built_once_and_updated_in_place(
+    sampling: bool, heads: str
+) -> None:
     """
     On a configuration whose cache dwarfs its activations, compiled at two cache
     lengths: the prefill (which allocates the cache) costs about one cache, and the
-    chunk, whose decoding state is donated, updates it in place.
+    chunk, whose decoding state is donated, updates it in place (in particular, it
+    never copies the cache into another layout).
     """
 
-    eng = _engine()
+    changes, (short, long) = HEADS[heads]
+    eng = _engine(**changes)
     prefill_cost = {}
     chunk_temp = {}
-    for max_new_tokens in (4096, 8192):
+    for max_new_tokens in (short, long):
         key = ShapeKey(
             "generate",
             PROMPT,
@@ -111,13 +141,13 @@ def test_kv_cache_is_built_once_and_updated_in_place(sampling: bool) -> None:
         _assert_in_place(chunk, _state_bytes(eng, max_new_tokens))
         chunk_temp[max_new_tokens] = chunk.temp_size_in_bytes
 
-    cache_delta = _cache_bytes(eng, 8192) - _cache_bytes(eng, 4096)
-    assert prefill_cost[8192] - prefill_cost[4096] <= 1.25 * cache_delta
-    assert chunk_temp[8192] - chunk_temp[4096] <= 0.25 * cache_delta
+    cache_delta = _cache_bytes(eng, long) - _cache_bytes(eng, short)
+    assert prefill_cost[long] - prefill_cost[short] <= 1.25 * cache_delta
+    assert chunk_temp[long] - chunk_temp[short] <= 0.25 * cache_delta
 
     # The engine's estimate counts the cache once.
     need = eng.memory_need(key, BATCH)
-    assert _cache_bytes(eng, 8192) <= need <= 1.5 * _cache_bytes(eng, 8192)
+    assert _cache_bytes(eng, long) <= need <= 1.5 * _cache_bytes(eng, long)
 
 
 def test_long_rope_reprefill_rebuilds_the_cache_in_place() -> None:

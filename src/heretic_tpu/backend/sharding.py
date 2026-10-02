@@ -119,10 +119,13 @@ class ShardingPlan:
 
     @property
     def kv_cache_sharding(self) -> jax.sharding.Sharding:
-        """Sharding of a KV cache array [L, B, T_cache, KV, hd]."""
+        """
+        Sharding of a KV cache array [L, B, KV, T_cache, hd] (the engine's head-major
+        layout): along the key/value heads when attention is sharded.
+        """
 
         if self.attention_sharded:
-            return self.sharding(PartitionSpec(None, None, None, MODEL_AXIS, None))
+            return self.sharding(PartitionSpec(None, None, MODEL_AXIS, None, None))
         return self.replicated
 
 

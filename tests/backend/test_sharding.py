@@ -53,6 +53,10 @@ def test_single_plan() -> None:
     assert choose_plan(real_arch("Qwen/Qwen3-0.6B"), np.float32, "single") != plan
 
 
+@pytest.mark.skipif(
+    jax.default_backend() != "cpu",
+    reason="tests the plan on CPU devices",
+)
 def test_auto_is_single_on_cpu() -> None:
     arch = real_arch("Qwen/Qwen3-4B-Instruct-2507")
     assert jax.local_devices()[0].memory_stats() is None
@@ -327,7 +331,7 @@ def test_tensor_parallel_loading_on_four_cpu_devices(tmp_path) -> None:
     ]
     assert attention["lora_a_spec"] == [None, None, None, "model"]
     assert attention["lora_b_spec"] == []
-    assert attention["kv_cache_spec"] == [None, None, None, "model", None]
+    assert attention["kv_cache_spec"] == [None, None, "model", None, None]
 
     gemma3 = summaries["gemma3"]
     assert not gemma3["attention_sharded"] and gemma3["mlp_sharded"]

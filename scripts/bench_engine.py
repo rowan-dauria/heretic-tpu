@@ -4,7 +4,7 @@
 """
 Benchmarks the engine on a real model: greedy generation of chat prompts at a range of
 batch sizes (tokens per second, time per decode chunk, compile time), the capture of
-residuals and module I/O, and the capture of logits.
+residuals and module I/O, the capture of logits, and the peak device memory.
 
 Usage (on a TPU VM, see scripts/tpu.sh):
 
@@ -119,6 +119,19 @@ def load(model: str, dtype: Any) -> tuple[Any, ArchConfig, Any, Any, float]:
     return ckpt, arch, plan, params, time.perf_counter() - start
 
 
+def device_memory() -> dict[str, float] | None:
+    """Bytes in use and the peak so far on the first device, in GiB (None on CPU)."""
+
+    stats = jax.devices()[0].memory_stats()
+    if stats is None:
+        return None
+    return {
+        "in_use_gib": round(stats["bytes_in_use"] / 2**30, 2),
+        "peak_gib": round(stats["peak_bytes_in_use"] / 2**30, 2),
+        "limit_gib": round(stats["bytes_limit"] / 2**30, 2),
+    }
+
+
 def tokenize(tokenizer: Any, prompts: list[str]) -> list[list[int]]:
     texts = [
         tokenizer.apply_chat_template(
@@ -188,6 +201,8 @@ def bench_generation(
         if len(stamps) > 1
         else None,
         "tokens_per_second": round(batch_size * steps / seconds, 1),
+        # Device memory beyond the parameters (see Engine.memory_need).
+        "memory_need_gib": round(eng.memory_need(key, batch_size) / 2**30, 3),
         "finish_mean": float(generated.finish.mean()),
         "first_tokens": generated.tokens[0, :16].tolist(),
     }
@@ -285,7 +300,12 @@ def main() -> None:
     ckpt, arch, plan, params, load_seconds = load(args.model, dtype)
     results["load_seconds"] = round(load_seconds, 1)
     results["plan"] = plan.kind
-    print(f"Loaded {args.model} ({plan.kind}) in {load_seconds:.1f} s", flush=True)
+    results["memory_after_load"] = device_memory()
+    print(
+        f"Loaded {args.model} ({plan.kind}) in {load_seconds:.1f} s,",
+        f"device memory {results['memory_after_load']}",
+        flush=True,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=ckpt.sha)
     if tokenizer.pad_token is None:
@@ -317,6 +337,8 @@ def main() -> None:
             "Response 0:",
             repr(tokenizer.decode(results["generation"][-1]["first_tokens"])),
         )
+        results["memory_after_generation"] = device_memory()
+        print("Device memory:", results["memory_after_generation"], flush=True)
 
     if "capture" not in skip:
         for name, count, want in (
@@ -329,6 +351,8 @@ def main() -> None:
             )
             results[name] = result
             print(name, json.dumps(result), flush=True)
+        results["memory_after_capture"] = device_memory()
+        print("Device memory:", results["memory_after_capture"], flush=True)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as file:

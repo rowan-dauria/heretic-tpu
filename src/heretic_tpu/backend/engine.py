@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax.experimental.layout import Format, Layout
 from transformers import GenerationConfig
 
 from . import transformer
@@ -214,6 +215,19 @@ class _DecodeState(NamedTuple):
 
     # Number of tokens generated so far; the next decode step consumes the newest.
     step: jax.Array  # int32 []
+
+
+class _Progress(NamedTuple):
+    """The progress of a generation after a device call."""
+
+    # The decoding state, which the next device call donates.
+    state: _DecodeState
+
+    # Number of tokens generated so far.
+    step: int
+
+    # int32 [B, max_new_tokens] on the host, if fetched (streaming and stop_check).
+    tokens: np.ndarray | None
 
 
 def is_out_of_memory(e: BaseException) -> bool:
@@ -692,10 +706,12 @@ def _generation_prefill(
     arch: ArchConfig,
     max_new_tokens: int,
     sampling: bool,
+    cache_layout: tuple[int, ...] | None = None,
 ) -> _DecodeState:
     """
-    Runs the prompt, builds the KV cache (only needed for a second token) and selects
-    the first token. Filler rows (`real` false) start as finished.
+    Runs the prompt, builds the KV cache (only needed for a second token; each
+    layer's slice in `cache_layout`) and selects the first token. Filler rows
+    (`real` false) start as finished.
     """
 
     batch, length = tokens.shape
@@ -708,6 +724,7 @@ def _generation_prefill(
         long_factor,
         arch=arch,
         cache_len=cache_len,
+        cache_layout=cache_layout,
     )
 
     # Every real prompt token is penalised (padding slots are scattered out of
@@ -814,6 +831,7 @@ def _generation_reprefill(
     *,
     arch: ArchConfig,
     sampling: bool,
+    cache_layout: tuple[int, ...] | None = None,
 ) -> _DecodeState:
     """
     Runs the decode step at which some rows switch to the long RoPE factors as a
@@ -846,6 +864,7 @@ def _generation_reprefill(
         step >= switch_steps,
         arch=arch,
         cache_len=length + max_new_tokens,
+        cache_layout=cache_layout,
         column=length + step - 1,
     )
     return _advance(
@@ -1002,7 +1021,7 @@ class Engine:
             raise ValueError(f"Invalid captures: {sorted(want)}")
 
         self._check_batch(batch)
-        key = ShapeKey("capture", batch.tokens.shape[1], self._rank(lora), want=want)
+        key = ShapeKey("capture", batch.tokens.shape[1], self.rank(lora), want=want)
         long_factor = self._forward_long_factor(batch)
         program = self._ready(key, batch.tokens.shape[0])["capture"]
         return program.compiled(params, lora, batch.tokens, batch.mask, long_factor)
@@ -1049,14 +1068,13 @@ class Engine:
             raise ValueError("Streaming needs a batch of one row.")
 
         emitted = 0
-        for state in self._generation(
+        for progress in self._generation(
             params, lora, batch, spec, STREAM_CHUNK, "stream", None
         ):
-            tokens = np.asarray(state.tokens)[0]
-            step = int(state.step)
-            for index in range(emitted, step):
+            tokens = progress.tokens[0]
+            for index in range(emitted, progress.step):
                 yield tokens[index : index + 1]
-            emitted = step
+            emitted = progress.step
 
     def score(
         self,
@@ -1076,7 +1094,7 @@ class Engine:
             raise ValueError("cand and cand_mask must be [B, G].")
 
         key = ShapeKey(
-            "score", length, self._rank(lora), C_score=batch.C_score, G=batch.G
+            "score", length, self.rank(lora), C_score=batch.C_score, G=batch.G
         )
         long_factor = self._forward_long_factor(batch)
         program = self._ready(key, batch.tokens.shape[0])["score"]
@@ -1228,10 +1246,11 @@ class Engine:
         chunk: int,
         entry: str,
         stop_check: StopCheck | None,
-    ) -> Generator[_DecodeState, None, Generated]:
+    ) -> Generator[_Progress, None, Generated]:
         """
-        Runs a generation and yields the decoding state after every device call (to
-        be read before resuming, because the next call donates it).
+        Runs a generation and yields its progress after every device call (the
+        decoding state is to be read before resuming, because the next call donates
+        it). The host synchronises once per device call.
         """
 
         self._check_batch(batch)
@@ -1244,7 +1263,7 @@ class Engine:
         key = ShapeKey(
             entry,
             length,
-            self._rank(lora),
+            self.rank(lora),
             max_new_tokens=max_new_tokens,
             C_chunk=chunk,
             sampling=spec.sampling,
@@ -1280,17 +1299,22 @@ class Engine:
             sampling_arrays,
         )
 
+        # Streaming and stop_check need the tokens after every call.
+        fetch_tokens = entry == "stream" or stop_check is not None
+
         while True:
-            step, done = jax.device_get((state.step, state.done))
+            step, done, generated = jax.device_get(
+                (state.step, state.done, state.tokens if fetch_tokens else None)
+            )
             step = int(step)
             done = np.array(done[:n_real])
-            yield state
+            yield _Progress(state=state, step=step, tokens=generated)
 
             if step >= max_new_tokens or done.all():
                 break
 
             if stop_check is not None:
-                generated = np.asarray(state.tokens)[:n_real, :step]
+                generated = np.asarray(generated)[:n_real, :step]
                 finish_now = np.asarray(stop_check(generated, done.copy()), dtype=bool)
                 marks[:n_real] = finish_now & ~done
                 done |= finish_now
@@ -1435,43 +1459,59 @@ class Engine:
 
         statics = {"arch": arch, "sampling": key.sampling}
         sampling_arrays = self._sampling_skeleton(key.sampling)
-        with_cache = key.max_new_tokens > 1
-        state = self._state_skeleton(key, batch_size, with_cache)
-        state_shardings = jax.tree.map(lambda leaf: leaf.sharding, state)
         ref_len = self._abstract((batch_size,), np.int32)
+        prefill_args = (params, lora, tokens, mask, ref_len, row_flags, long_factor)
+        prefill_args += (sampling_arrays,)
+        prefill = functools.partial(
+            _generation_prefill, max_new_tokens=key.max_new_tokens, **statics
+        )
 
-        programs = {
-            "prefill": self._lower(
-                functools.partial(
-                    _generation_prefill, max_new_tokens=key.max_new_tokens, **statics
-                ),
-                (params, lora, tokens, mask, ref_len, row_flags, long_factor)
-                + (sampling_arrays,),
-                out_shardings=state_shardings,
-            )
-        }
-        if not with_cache:
+        if key.max_new_tokens == 1:
             # A single token needs neither a cache nor a decode step.
-            return programs
+            state = self._state_skeleton(key, batch_size, None)
+            return {
+                "prefill": self._lower(
+                    prefill, prefill_args, out_shardings=_formats(state)
+                )
+            }
 
         switch_steps = None
         if arch.rope_switch == "long_factor":
             switch_steps = self._abstract((batch_size,), np.int32)
         stop_at = self._abstract((), np.int32)
 
-        programs["chunk"] = self._lower(
-            functools.partial(_generation_chunk, chunk=key.C_chunk, **statics),
-            (params, lora, state, mask, switch_steps, stop_at, row_flags)
-            + (sampling_arrays,),
-            out_shardings=state_shardings,
-            donate_argnums=(2,),
-        )
+        # The prefill and the re-prefill build the cache directly in the layout in
+        # which it crosses executable boundaries (see `kv_cache_layout`).
+        cache_layout = kv_cache_layout(arch)
+        cache_format = self.plan.kv_cache_sharding
+        if cache_layout is not None:
+            # The layer axis is the major one.
+            major_to_minor = (0, *(axis + 1 for axis in cache_layout))
+            cache_format = Format(Layout(major_to_minor=major_to_minor), cache_format)
+        state = self._state_skeleton(key, batch_size, cache_format)
+
+        programs = {
+            "prefill": self._lower(
+                functools.partial(prefill, cache_layout=cache_layout),
+                prefill_args,
+                out_shardings=_formats(state),
+            ),
+            "chunk": self._lower(
+                functools.partial(_generation_chunk, chunk=key.C_chunk, **statics),
+                (params, lora, state, mask, switch_steps, stop_at, row_flags)
+                + (sampling_arrays,),
+                out_shardings=_formats(state),
+                donate_argnums=(2,),
+            ),
+        }
         if arch.rope_switch == "long_factor":
             programs["reprefill"] = self._lower(
-                functools.partial(_generation_reprefill, **statics),
+                functools.partial(
+                    _generation_reprefill, cache_layout=cache_layout, **statics
+                ),
                 (params, lora, state, tokens, mask, switch_steps, row_flags)
                 + (sampling_arrays,),
-                out_shardings=state_shardings,
+                out_shardings=_formats(state),
                 donate_argnums=(2,),
             )
         return programs
@@ -1557,21 +1597,21 @@ class Engine:
         self,
         key: ShapeKey,
         batch_size: int,
-        with_cache: bool,
+        cache_format: jax.sharding.Sharding | Format | None,
     ) -> _DecodeState:
+        """The decoding state, with a cache in `cache_format` unless it is None."""
+
         arch = self.arch
         cache = None
-        if with_cache:
+        if cache_format is not None:
             shape = (
                 arch.num_hidden_layers,
                 batch_size,
-                key.T + key.max_new_tokens,
                 arch.num_key_value_heads,
+                key.T + key.max_new_tokens,
                 arch.head_dim,
             )
-            part = jax.ShapeDtypeStruct(
-                shape, self.dtype, sharding=self.plan.kv_cache_sharding
-            )
+            part = jax.ShapeDtypeStruct(shape, self.dtype, sharding=cache_format)
             cache = (part, part)
 
         return _DecodeState(
@@ -1594,7 +1634,12 @@ class Engine:
 
     # Validation.
 
-    def _rank(self, lora: Lora | None) -> int | None:
+    def rank(self, lora: Lora | None) -> int | None:
+        """
+        The LoRA rank of shape keys for calls with these adapters (None without
+        adapters). Raises ValueError for adapters the engine cannot run.
+        """
+
         if lora is None:
             return None
 
@@ -1619,6 +1664,29 @@ class Engine:
             raise ValueError("ref_len must be [B].")
         if not 1 <= batch.n_real <= batch_size:
             raise ValueError(f"n_real must be between 1 and {batch_size}.")
+
+
+def _formats(tree: Any) -> Any:
+    """The formats (shardings and layouts) of a pytree of abstract arrays."""
+
+    return jax.tree.map(lambda leaf: leaf.format, tree)
+
+
+def kv_cache_layout(arch: ArchConfig) -> tuple[int, ...] | None:
+    """
+    The layout (major to minor) of each layer's slice [B, KV, T_cache, hd] of the KV
+    cache when the cache crosses executable boundaries: row-major, the layout decode
+    attention reads it in, when the head dimension fills whole TPU lanes (multiples
+    of 128); otherwise None, the compiler's default, which XLA:TPU chooses to
+    minimise padding. (For a T_cache that is not a multiple of 8, that default puts
+    the slots outside the heads, and every chunk call would copy the whole cache into
+    row-major layout and back. Narrower heads, on the other hand, would be padded to
+    128 lanes in row-major layout, and their decode attention reads the default.)
+    """
+
+    if arch.head_dim % 128 == 0:
+        return (0, 1, 2, 3)
+    return None
 
 
 def _memory_stats(devices: Sequence[jax.Device]) -> list[dict[str, int]] | None:

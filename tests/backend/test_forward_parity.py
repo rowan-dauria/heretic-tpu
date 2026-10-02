@@ -602,8 +602,8 @@ def test_prefill_and_decode_match_full_forward(models, name: str) -> None:
         shape = (
             arch.num_hidden_layers,
             4,
-            cache_len,
             arch.num_key_value_heads,
+            cache_len,
             arch.head_dim,
         )
         assert cache[0].shape == shape and cache[1].shape == shape
@@ -640,9 +640,11 @@ def test_prefill_and_decode_match_full_forward(models, name: str) -> None:
     )
     _assert_close(captures.logits, adapted[:, newest])
     for rebuilt_part, part in zip(rebuilt, cache):
-        _assert_close(
-            np.asarray(rebuilt_part)[:, written], np.asarray(part)[:, written]
-        )
+        # [L, B, KV, T_cache, hd] -> [B, T_cache, L, KV, hd], to select slots.
+        def slots(array):
+            return np.asarray(array).transpose(1, 3, 0, 2, 4)[written]
+
+        _assert_close(slots(rebuilt_part), slots(part))
 
 
 def test_long_factor_per_row(models) -> None:
@@ -962,8 +964,8 @@ def test_kv_cache_is_not_copied(models) -> None:
         shape = (
             arch.num_hidden_layers,
             batch,
-            cache_len,
             arch.num_key_value_heads,
+            cache_len,
             arch.head_dim,
         )
         cache = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 2

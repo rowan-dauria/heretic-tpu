@@ -744,6 +744,35 @@ def test_fits_reserves_memory(monkeypatch) -> None:
     assert on_device.fits(key, 8)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_cache_layout_is_kept_across_executables(head_dim: int) -> None:
+    """
+    The cache leaves the prefill in the layout the chunk takes and returns it in, and
+    heads that fill whole TPU lanes pin it to row-major [L, B, KV, T_cache, hd].
+    """
+
+    rope = RopeSpec(
+        rope_type="default",
+        rot=head_dim,
+        params=(("rope_theta", 10000.0), ("rope_type", "default")),
+    )
+    arch = synthetic_arch(head_dim=head_dim, rope=(rope,) * 2)
+    eng = Engine(arch, choose_plan(arch, np.float32, "single"), np.float32)
+    key = ShapeKey("generate", 32, None, max_new_tokens=7, C_chunk=4)
+    programs = eng._compile(key, 2).programs
+
+    prefill = programs["prefill"].compiled.output_formats.cache
+    chunk_in = programs["chunk"].compiled.input_formats[0][2].cache
+    chunk_out = programs["chunk"].compiled.output_formats.cache
+    assert prefill == chunk_in == chunk_out
+    for part in chunk_in:
+        if head_dim == 128:
+            assert engine.kv_cache_layout(arch) == (0, 1, 2, 3)
+            assert part.layout.major_to_minor == (0, 1, 2, 3, 4)
+        else:
+            assert engine.kv_cache_layout(arch) is None
+
+
 def test_adapter_values_are_arguments(llama) -> None:
     """
     Parameters and adapters are arguments, never compile-time constants: new adapter

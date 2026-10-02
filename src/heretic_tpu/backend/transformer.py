@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax.experimental.layout import Layout, with_layout_constraint
 
 from . import layers
 from .arch import ArchConfig
@@ -32,7 +33,10 @@ from .weights import Params, abliterable_components
 # Component -> (A [L, M, r, d_in], B [L, M, d_out, r]), both float32.
 Lora = dict[str, tuple[jax.Array, jax.Array]]
 
-# (keys, values), each [L, B, T_cache, KV, hd] in the model dtype.
+# (keys, values), each [L, B, KV, T_cache, hd] in the model dtype. The slot axis is
+# next to the head dimension, as decode attention reads the cache on TPUs (with the
+# slots outside the key/value heads, XLA would copy the whole cache into this layout
+# and back on every call that carries it).
 KVCache = tuple[jax.Array, jax.Array]
 
 # Component -> (inputs [B, L, M, d_in], outputs [B, L, M, d_out]), model dtype.
@@ -205,6 +209,11 @@ def _layer(
     v = v.reshape(batch, length, arch.num_key_value_heads, head_dim)
 
     if arch.has_qk_norm:
+        # The projections are materialised in the model dtype first. Otherwise
+        # XLA:TPU keeps their float32 accumulators for the norms and moves them into
+        # the layout of attention in float32 (a tenth of the prefill time of
+        # Qwen3-4B).
+        q, k = lax.optimization_barrier((q, k))
         q = layers.rms_norm(q, layer["q_norm"], eps, gemma=gemma)
         k = layers.rms_norm(k, layer["k_norm"], eps, gemma=gemma)
 
@@ -318,6 +327,7 @@ def decoder(
     *,
     arch: ArchConfig,
     cache_len: int | None = None,
+    cache_layout: tuple[int, ...] | None = None,
     capture: frozenset[str] = frozenset(),
     column: jax.Array | int | None = None,
 ) -> DecoderOutputs:
@@ -326,10 +336,13 @@ def decoder(
 
     `long_factor` (bool [B]) selects the long RoPE factors per row (`longrope` only;
     None means short factors for every row). With `cache_len` (at least T), the
-    output includes the KV cache [L, B, cache_len, KV, hd], built in its final shape:
+    output includes the KV cache [L, B, KV, cache_len, hd], built in its final shape:
     each layer returns its keys and values padded to `cache_len` as scan outputs, so
-    the stacked outputs are the cache. `capture` (a subset of {"hidden",
-    "module_io"}) selects quantities captured at column `column` (default T - 1).
+    the stacked outputs are the cache. `cache_layout` (major to minor), if given, is
+    the layout of each layer's slice [B, KV, cache_len, hd] of the cache, which XLA
+    then stacks in the layout the cache is needed in instead of copying it at the
+    end. `capture` (a subset of {"hidden", "module_io"}) selects quantities captured
+    at column `column` (default T - 1).
     """
 
     unknown = capture - {"hidden", "module_io"}
@@ -362,9 +375,15 @@ def decoder(
 
         ys = {}
         if cache_len is not None:
-            padding = ((0, 0), (0, cache_len - length), (0, 0), (0, 0))
-            ys["k"] = jnp.pad(out.k, padding)
-            ys["v"] = jnp.pad(out.v, padding)
+            # [B, T, KV, hd] -> [B, KV, cache_len, hd].
+            padding = ((0, 0), (0, 0), (0, cache_len - length), (0, 0))
+            for name, value in (("k", out.k), ("v", out.v)):
+                value = jnp.pad(jnp.swapaxes(value, 1, 2), padding)
+                if cache_layout is not None:
+                    value = with_layout_constraint(
+                        value, Layout(major_to_minor=cache_layout)
+                    )
+                ys[name] = value
         if "hidden" in capture:
             ys["hidden"] = _column(out.x, column)
         if "module_io" in capture:
@@ -416,12 +435,14 @@ def prefill(
     arch: ArchConfig,
     want: frozenset[str] = frozenset({"logits"}),
     cache_len: int | None = None,
+    cache_layout: tuple[int, ...] | None = None,
     column: jax.Array | int | None = None,
 ) -> tuple[Captures, KVCache | None]:
     """
     Runs the decoder over a left-padded batch and returns the quantities in `want`
     (a subset of `CAPTURES`) at column `column` (default T - 1, the last prompt
-    position) and, with `cache_len`, the KV cache (see `decoder`).
+    position) and, with `cache_len`, the KV cache (see `decoder`, also for
+    `cache_layout`).
 
     The re-prefill of long-RoPE generation is a prefill over all `cache_len` slots
     (unwritten slots masked) with `column` the newest slot.
@@ -441,6 +462,7 @@ def prefill(
         long_factor,
         arch=arch,
         cache_len=cache_len,
+        cache_layout=cache_layout,
         capture=want - {"logits"},
         column=column,
     )
@@ -471,10 +493,10 @@ def decode_step(
 
     `kv_mask` (bool [B, T_cache]) is true for the slots that hold real tokens; slots
     at or after `slot` are treated as unwritten whatever it says. `long_factor` is as
-    for `decoder`, evaluated for this step. Each layer reads its
-    cache slice as a scan input and returns only the new keys and values [B, KV, hd];
-    one `dynamic_update_slice` then writes [L, B, 1, KV, hd] at `slot`, which updates
-    a donated cache in place.
+    for `decoder`, evaluated for this step. Each layer reads its cache slice as a
+    scan input and returns only the new keys and values [B, KV, hd]; one
+    `dynamic_update_slice` then writes [L, B, KV, 1, hd] at `slot`, which updates a
+    donated cache in place.
     """
 
     k_cache, v_cache = cache
@@ -516,12 +538,12 @@ def decode_step(
         (*_layer_inputs(arch, params, lora), k_cache, v_cache),
     )
 
-    start = (0, 0, slot, 0, 0)
+    start = (0, 0, 0, slot, 0)
     k_cache = lax.dynamic_update_slice(
-        k_cache, k_new[:, :, None].astype(k_cache.dtype), start
+        k_cache, k_new[:, :, :, None].astype(k_cache.dtype), start
     )
     v_cache = lax.dynamic_update_slice(
-        v_cache, v_new[:, :, None].astype(v_cache.dtype), start
+        v_cache, v_new[:, :, :, None].astype(v_cache.dtype), start
     )
 
     return unembed(params, x[:, 0], arch=arch), (k_cache, v_cache)

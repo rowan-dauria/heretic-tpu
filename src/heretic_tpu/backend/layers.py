@@ -282,7 +282,7 @@ def decode_attention(
 ) -> jax.Array:
     """
     Attention of one new token per row, q [B, H, hd] at cache slot `slot`, over the
-    cached keys and values [B, T_cache, KV, hd] before that slot plus the token's own
+    cached keys and values [B, KV, T_cache, hd] before that slot plus the token's own
     key and value k_new, v_new [B, KV, hd] as an extra column.
 
     Cached slot j is visible iff `kv_mask[b, j]`, `j < slot` and `slot - j < window`;
@@ -291,7 +291,7 @@ def decode_attention(
     """
 
     batch, heads, head_dim = q.shape
-    cache_len, kv_heads = k_cache.shape[1:3]
+    kv_heads, cache_len = k_cache.shape[1:3]
     dtype = q.dtype
 
     q = q.reshape(batch, kv_heads, heads // kv_heads, head_dim)
@@ -303,7 +303,7 @@ def decode_attention(
     visible = jnp.concatenate([visible, jnp.ones((batch, 1), dtype=bool)], axis=-1)
 
     cached_scores = jnp.einsum(
-        "bkgd,btkd->bkgt",
+        "bkgd,bktd->bkgt",
         q,
         k_cache,
         preferred_element_type=jnp.float32,
@@ -319,7 +319,7 @@ def decode_attention(
 
     # Both parts are accumulated in float32 and rounded once, like one matmul.
     out = jnp.einsum(
-        "bkgt,btkd->bkgd",
+        "bkgt,bktd->bkgd",
         probs[..., :cache_len],
         v_cache,
         preferred_element_type=jnp.float32,
