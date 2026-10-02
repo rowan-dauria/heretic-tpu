@@ -5,8 +5,9 @@
 # It fixes the plugin-facing API so that modules written against it can be imported
 # and tested with fakes before the facade itself is implemented.
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import jax
 import jax.numpy as jnp
