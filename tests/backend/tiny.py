@@ -86,14 +86,14 @@ tie_word_embeddings=None, max_shard_size=None, edit_config=None) -> Path`
     Adds files that must never be downloaded, opened or exported:
     consolidated.safetensors, params.json and original/x.pth. Returns their names.
 
-`FakeHub(root, repos)`
+`FakeHub(root, repos, shas=None)`
     Serves local directories (`repos`: Hub id -> directory) as Hub repositories,
     downloading into snapshot directories under `root`, for code that calls
     `HfApi().model_info` and `snapshot_download`, and records every downloaded file
     in `downloads` (a list of (repo_id, filename)). `install(monkeypatch, *modules)`
     replaces the `HfApi` and `snapshot_download` names in the given modules (by
-    default heretic_tpu.backend.weights). Each repository has the single commit
-    `FakeHub.SHA`.
+    default heretic_tpu.backend.weights). Each repository has a single commit:
+    `shas[repo_id]` if given, otherwise `FakeHub.SHA`.
 """
 
 from __future__ import annotations
@@ -365,10 +365,19 @@ def add_stray_files(directory: str | Path) -> list[str]:
 class FakeHub:
     SHA = "0123456789abcdef0123456789abcdef01234567"
 
-    def __init__(self, root: str | Path, repos: dict[str, str | Path]):
+    def __init__(
+        self,
+        root: str | Path,
+        repos: dict[str, str | Path],
+        shas: dict[str, str] | None = None,
+    ):
         self.root = Path(root)
         self.repos = {repo_id: Path(path) for repo_id, path in repos.items()}
+        self.shas = shas or {}
         self.downloads: list[tuple[str, str]] = []
+
+    def sha(self, repo_id: str) -> str:
+        return self.shas.get(repo_id, self.SHA)
 
     def _files(self, repo_id: str) -> list[str]:
         repo = self.repos[repo_id]
@@ -379,10 +388,10 @@ class FakeHub:
         )
 
     def model_info(self, repo_id: str, revision: str | None = None, **kwargs: Any):
-        if revision not in (None, "main", self.SHA):
+        if revision not in (None, "main", self.sha(repo_id)):
             raise ValueError(f"Unknown revision: {revision}")
         return SimpleNamespace(
-            sha=self.SHA,
+            sha=self.sha(repo_id),
             siblings=[SimpleNamespace(rfilename=name) for name in self._files(repo_id)],
         )
 
@@ -393,8 +402,8 @@ class FakeHub:
         allow_patterns: list[str] | str | None = None,
         **kwargs: Any,
     ) -> str:
-        assert revision == self.SHA, "downloads must use the resolved commit"
-        snapshot = self.root / repo_id.replace("/", "--") / self.SHA
+        assert revision == self.sha(repo_id), "downloads must use the resolved commit"
+        snapshot = self.root / repo_id.replace("/", "--") / revision
         snapshot.mkdir(parents=True, exist_ok=True)
 
         for name in filter_repo_objects(

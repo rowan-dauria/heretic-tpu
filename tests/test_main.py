@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import ast
 import json
 import os
 import subprocess
@@ -23,6 +24,7 @@ import tomli_w
 from optuna import Trial
 from optuna.study import StudyDirection
 
+import heretic_tpu
 from heretic_tpu import main, utils
 from heretic_tpu.backend.errors import DeviceMemoryError
 from heretic_tpu.config import ExportStrategy, ModifierConfig, Settings
@@ -42,14 +44,6 @@ def out_of_memory_error() -> jax.errors.JaxRuntimeError:
     return jax.errors.JaxRuntimeError(
         "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 1.00GiB."
     )
-
-
-def is_out_of_memory_as_designed(error: BaseException) -> bool:
-    """`is_out_of_memory` as specified in docs/DESIGN.md ("Engine shape policy")."""
-    return (
-        isinstance(error, jax.errors.JaxRuntimeError)
-        and "RESOURCE_EXHAUSTED" in str(error)
-    ) or isinstance(error, DeviceMemoryError)
 
 
 class StopRun(Exception):
@@ -267,12 +261,6 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     monkeypatch.setattr(main, "version", lambda name: "0.0.0")
     monkeypatch.setattr(utils, "version", lambda name: "0.0.0")
 
-    try:
-        main.is_out_of_memory(RuntimeError())
-    except NotImplementedError:
-        # The facade is not implemented yet.
-        monkeypatch.setattr(main, "is_out_of_memory", is_out_of_memory_as_designed)
-
     return harness
 
 
@@ -345,26 +333,23 @@ def test_help_does_not_import_heavy_modules(tmp_path: Path) -> None:
     assert heavy_modules == []
 
 
-@pytest.mark.parametrize("block_dropped_modules", [False, True])
-def test_cli_modules_do_not_import_pytorch(
-    tmp_path: Path,
-    block_dropped_modules: bool,
-) -> None:
+def test_cli_modules_do_not_import_pytorch(tmp_path: Path) -> None:
     # With the modules blocked, importing them fails, as without PyTorch installed.
-    # Without the block, the modules must still not be imported where they are installed.
     result = run_python(
         f"""
         import sys
 
-        if {block_dropped_modules!r}:
-            for name in {DROPPED_MODULES!r}:
-                sys.modules[name] = None
+        for name in {DROPPED_MODULES!r}:
+            sys.modules[name] = None
 
         sys.argv = ["heretic-tpu"]
 
+        import heretic_tpu.backend.lm_eval_adapter
         import heretic_tpu.evaluator
         import heretic_tpu.main
         import heretic_tpu.modifier
+        import heretic_tpu.modifiers.abliteration
+        import heretic_tpu.modifiers.ara
         import heretic_tpu.plugin
         import heretic_tpu.scorer
         import heretic_tpu.scorers.benchmark_score
@@ -378,6 +363,33 @@ def test_cli_modules_do_not_import_pytorch(
     )
 
     assert result.stdout.strip().splitlines()[-1] == "[]"
+
+
+def test_package_never_imports_dropped_modules() -> None:
+    # Where PyTorch is installed, transformers imports it (and AutoTokenizer imports
+    # accelerate) on its own, so what matters is that heretic-tpu itself never does.
+    forbidden = [*DROPPED_MODULES, "lm_eval.models.huggingface"]
+    package_directory = Path(heretic_tpu.__file__).parent
+
+    imports = []
+    for path in sorted(package_directory.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                names = [node.module or ""]
+                # "from lm_eval.models import huggingface"
+                names += [f"{node.module}.{alias.name}" for alias in node.names]
+            else:
+                continue
+            for name in names:
+                if any(
+                    name == module or name.startswith(f"{module}.")
+                    for module in forbidden
+                ):
+                    imports.append((path.relative_to(package_directory), name))
+
+    assert imports == []
 
 
 def test_compilation_cache_is_configured_before_model(
@@ -505,6 +517,27 @@ def test_save_action_exports_without_restoring_model(
         *TRIAL_EVENTS,
         (method, save_directory),
     ]
+
+
+def test_restored_settings_keep_the_compilation_cache(
+    harness: Harness,
+    tmp_path: Path,
+) -> None:
+    write_trial_config(tmp_path, model_action="")
+    main.run()
+
+    # Settings restored from the finished study don't contain the cache directory,
+    # which the settings sources (here config.toml) of the current invocation give.
+    harness.events.clear()
+    write_trial_config(
+        tmp_path,
+        model_action="",
+        checkpoint_action="continue",
+        compilation_cache_dir=str(tmp_path / "other"),
+    )
+    main.run()
+
+    assert harness.events[0] == ("configure_compilation_cache", str(tmp_path / "other"))
 
 
 @pytest.mark.parametrize(

@@ -491,12 +491,16 @@ def test_float8_linear_weight_rejected(tmp_path) -> None:
 
 
 class _FakeDevice:
-    def __init__(self, device, bytes_limit: int):
+    """A device with the given memory limit, or with no memory statistics (as CPUs)."""
+
+    def __init__(self, device, bytes_limit: int | None):
         self.device = device
         self.id = device.id
         self.bytes_limit = bytes_limit
 
-    def memory_stats(self) -> dict[str, int]:
+    def memory_stats(self) -> dict[str, int] | None:
+        if self.bytes_limit is None:
+            return None
         return {"bytes_limit": self.bytes_limit, "bytes_in_use": 0}
 
     def __str__(self) -> str:
@@ -515,12 +519,9 @@ def test_preflight(checkpoints, monkeypatch) -> None:
     assert footprint == sum(leaf.nbytes for leaf in jax.tree.leaves(params))
     assert weights.device_footprint(arch, np.float32, plan) > footprint
 
-    # CPU devices report no memory statistics, so the check is skipped.
-    assert plan.devices[0].memory_stats() is None
-    weights.check_device_memory(arch, np.float32, plan)
-
+    # Devices that report no memory statistics (CPUs) skip the check.
     device = plan.devices[0]
-    for limit, fits in [(footprint, True), (footprint - 1, False)]:
+    for limit, fits in [(None, True), (footprint, True), (footprint - 1, False)]:
         fake_devices = [_FakeDevice(device, limit)]
         monkeypatch.setattr(
             type(plan), "devices", property(lambda self, devices=fake_devices: devices)
