@@ -8,6 +8,13 @@
 #   scripts/tpu.sh sync         Copy the working tree (tracked and untracked, non-ignored files).
 #   scripts/tpu.sh run CMD...   Sync, then run CMD inside the synced tree on the VM.
 #   scripts/tpu.sh exec CMD...  Like run, but without syncing first.
+#   scripts/tpu.sh submit NAME CMD...
+#                               Sync, then start CMD detached on the VM (under the TPU
+#                               lock unless TPU_LOCK=0), logging to NAME.log in the
+#                               remote checkout. Don't sync the same checkout again
+#                               while the job runs, as syncing replaces its sources.
+#   scripts/tpu.sh logs NAME [LINES]
+#                               Show the tail of NAME.log and whether the job finished.
 #   scripts/tpu.sh shell        Open an interactive shell on the VM.
 #
 # Configuration (environment variables):
@@ -99,11 +106,38 @@ UV_PROJECT_ENVIRONMENT=\"$VENV\" uv sync --extra tpu --group dev --group parity"
         shift
         do_exec "$@"
         ;;
+    submit)
+        shift
+        name="${1:?usage: scripts/tpu.sh submit NAME CMD...}"
+        shift
+        do_sync
+        job="$(printf '%q' "$*")"
+        if [ "$LOCK" = "1" ]; then
+            job="flock /tmp/heretic-tpu.lock bash -c $job"
+        else
+            job="bash -c $job"
+        fi
+        # The exit status is written to NAME.exit so that `logs` can tell a finished
+        # job from a running one. setsid and the redirections detach the job from
+        # the SSH session.
+        wrapper="$(printf '%q' "$job; echo \$? > $name.exit")"
+        ssh_tpu --command="$(remote_prelude)
+rm -f $name.exit
+setsid nohup bash -c $wrapper > $name.log 2>&1 < /dev/null &
+echo \"Submitted $name (PID \$!); follow it with: scripts/tpu.sh logs $name\""
+        ;;
+    logs)
+        name="${2:?usage: scripts/tpu.sh logs NAME [LINES]}"
+        lines="${3:-50}"
+        ssh_tpu --command="cd \"\$HOME/$REMOTE_DIR\"
+tail -n $lines $name.log
+if [ -f $name.exit ]; then echo \"[finished with exit status \$(cat $name.exit)]\"; else echo '[still running]'; fi"
+        ;;
     shell)
         ssh_tpu
         ;;
     *)
-        sed -n '4,25p' "$0"
+        sed -n '/^# Usage:/,/^$/p' "$0"
         exit 1
         ;;
 esac
