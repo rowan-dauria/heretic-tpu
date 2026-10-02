@@ -287,7 +287,13 @@ def _host_adapters(
 
     host_adapters = {}
     for component in components:
-        A, B = (np.asarray(array, dtype=np.float32) for array in adapters[component])
+        # Host copies of device arrays can have the device's layout (for example,
+        # from a TPU, B with its rank axis major), and safetensors writes the buffer
+        # of a NumPy array without regard to its strides.
+        A, B = (
+            np.ascontiguousarray(array, dtype=np.float32)
+            for array in adapters[component]
+        )
         host_adapters[component] = (A, B)
 
     # Every component must have the rank of the first one.

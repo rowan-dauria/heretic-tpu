@@ -449,6 +449,56 @@ def test_adapter_export(checkpoints, name: str, tmp_path) -> None:
         np.testing.assert_array_equal(loaded[key], tensor)
 
 
+def test_adapter_export_of_strided_arrays(checkpoints, tmp_path) -> None:
+    # Host copies of TPU arrays can come in the device's layout, for example with
+    # the rank axis of B [L, M, d_out, r] major (non-C-contiguous strides), and
+    # safetensors writes the buffer of a NumPy array as it is.
+    ckpt, tensors, arch = _resolve(str(checkpoints["qwen2"]))
+    adapters = _random_adapters(arch, rank=3)
+    strided = {
+        component: tuple(np.asfortranarray(array) for array in pair)
+        for component, pair in adapters.items()
+    }
+    assert not strided["attn.o_proj"][1][0, 0].flags["C_CONTIGUOUS"]
+
+    target = tmp_path / "adapter"
+    export.save_adapter(
+        str(target),
+        ckpt,
+        arch,
+        strided,
+        base_model=str(checkpoints["qwen2"]),
+        model_commit=None,
+    )
+
+    _, exported = _read(target / export.ADAPTER_WEIGHTS_FILE)
+    for component, (A, B) in adapters.items():
+        for layer in range(arch.num_hidden_layers):
+            path = weights.module_path(arch, component, layer, 0)
+            prefix = f"base_model.model.{path}"
+            np.testing.assert_array_equal(
+                exported[f"{prefix}.lora_A.weight"], A[layer, 0]
+            )
+            np.testing.assert_array_equal(
+                exported[f"{prefix}.lora_B.weight"], B[layer, 0]
+            )
+
+    # The merged export is unaffected by the strides.
+    export.save_merged(
+        str(tmp_path / "merged"),
+        ckpt,
+        tensors,
+        arch,
+        strided,
+        _facade_tokenizer(str(checkpoints["qwen2"])),
+    )
+    _, merged = _read(tmp_path / "merged" / "model.safetensors")
+    for key, (B, A) in _modified_keys(tensors, adapters).items():
+        original = _read(checkpoints["qwen2"] / "model.safetensors")[1][key]
+        expected = (original.astype(np.float32) + B @ A).astype(original.dtype)
+        np.testing.assert_array_equal(merged[key], expected)
+
+
 def _logits(model, input_ids) -> np.ndarray:
     with torch.no_grad():
         return model(input_ids=input_ids).logits.float().numpy()
