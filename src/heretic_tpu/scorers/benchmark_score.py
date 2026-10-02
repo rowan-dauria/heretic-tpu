@@ -2,7 +2,6 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import lm_eval
-from lm_eval.models.huggingface import HFLM
 from pydantic import BaseModel, Field
 
 from heretic_tpu.scorer import Context, Score, Scorer
@@ -41,25 +40,20 @@ class BenchmarkScore(Scorer):
         return self.settings.score_name
 
     def init(self, ctx: Context) -> None:
+        # Imported on first use, so that the plugin can be loaded and validated
+        # without the lm-eval model API.
+        from heretic_tpu.backend.lm_eval_adapter import JaxLM
+
         model = ctx.get_model()
 
-        self.hflm = HFLM(
-            pretrained=model.model,  # ty:ignore[invalid-argument-type]
-            tokenizer=model.tokenizer,  # ty:ignore[invalid-argument-type]
-            batch_size="auto",
-        )
+        # JaxLM fetches the model's current state on every request, so the same
+        # object scores every trial and survives model reloads, e.g. when using
+        # --evaluate-model.
+        self.lm = JaxLM(model.tokenizer, model.lm_eval_state)
 
     def get_score(self, ctx: Context) -> Score:
-        # The purpose of this hack, where we initialize the HFLM object once,
-        # then update its internal model every time we calculate the score,
-        # is to get the benefits of batch size caching while allowing for
-        # model reloads, e.g. when using --evaluate-model.
-        model = ctx.get_model()
-        self.hflm.pretrained = model.model
-        self.hflm._model = model.model
-
         results = lm_eval.simple_evaluate(
-            model=self.hflm,
+            model=self.lm,
             tasks=[self.settings.task],
         )
 

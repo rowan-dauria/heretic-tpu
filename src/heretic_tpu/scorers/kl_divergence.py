@@ -1,13 +1,35 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-import torch.nn.functional as F
+import jax
+import jax.numpy as jnp
+import numpy as np
 from pydantic import BaseModel, Field
 
 from heretic_tpu.config import DatasetSpecification, SingleDatasetSpecification
+from heretic_tpu.model import Array
 from heretic_tpu.plugin import Context
 from heretic_tpu.scorer import Score, Scorer
 from heretic_tpu.utils import format_dataset_specification, print
+
+
+@jax.jit
+def get_logprobs(logits: Array) -> jax.Array:
+    return jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+
+
+@jax.jit
+def get_kl_divergence(logits: Array, target_logprobs: Array) -> jax.Array:
+    """
+    Computes `F.kl_div(log_softmax(logits), target_logprobs, reduction="batchmean",
+    log_target=True)`, i.e. the KL divergence of the distributions given by `logits`
+    from the target distributions, averaged over the batch.
+    """
+    logprobs = get_logprobs(logits)
+    return (
+        jnp.sum(jnp.exp(target_logprobs) * (target_logprobs - logprobs))
+        / logprobs.shape[0]
+    )
 
 
 class Settings(BaseModel):
@@ -50,18 +72,18 @@ class KLDivergence(Scorer):
         print("* Obtaining baseline first-token probability distributions...")
         baseline_logits = ctx.get_logits(self.prompts)
 
-        self._baseline_logprobs = F.log_softmax(baseline_logits, dim=-1)
+        self._baseline_logprobs: Array = get_logprobs(baseline_logits)
+
+        # With offload_outputs_to_cpu, the model returns host arrays, and the baseline
+        # is kept in host memory as well instead of occupying device memory for the
+        # whole run.
+        if isinstance(baseline_logits, np.ndarray):
+            self._baseline_logprobs = np.asarray(self._baseline_logprobs)
 
     def get_score(self, ctx: Context) -> Score:
         logits = ctx.get_logits(self.prompts)
-        logprobs = F.log_softmax(logits, dim=-1)
 
-        kl_divergence = F.kl_div(
-            logprobs,
-            self._baseline_logprobs,
-            reduction="batchmean",
-            log_target=True,
-        ).item()
+        kl_divergence = float(get_kl_divergence(logits, self._baseline_logprobs))
 
         return Score(
             value=kl_divergence,

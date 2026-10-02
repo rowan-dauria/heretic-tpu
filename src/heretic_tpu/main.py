@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-# ruff: noqa: E402
-
 import sys
 
 # Ensure standard output/error use UTF-8 instead of system default charmap (e.g. cp1252 on Windows).
@@ -48,14 +46,13 @@ from pathlib import Path
 from typing import Any, cast
 
 import huggingface_hub
+import jax
 import lm_eval
 import numpy as np
 import optuna
 import questionary
-import torch
 import transformers
 from huggingface_hub import HfApi, ModelCard, ModelCardData
-from lm_eval.models.huggingface import HFLM
 from optuna import Trial, TrialPruned
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers import TPESampler
@@ -72,10 +69,9 @@ from rich.traceback import install
 from .config import (
     DatasetSpecification,
     ExportStrategy,
-    QuantizationMethod,
 )
 from .evaluator import Evaluator
-from .model import Model, get_model_class
+from .model import Model, is_out_of_memory
 from .modifier import load_and_init_modifiers
 from .plugin import Context, is_builtin_plugin
 from .reproduce import (
@@ -83,7 +79,7 @@ from .reproduce import (
     collect_reproducibles,
     load_reproduction_information,
 )
-from .system import empty_cache, get_accelerator_info
+from .system import configure_compilation_cache, empty_cache, get_accelerator_info
 from .utils import (
     ask_if_unset,
     format_dataset_specification,
@@ -100,62 +96,11 @@ from .utils import (
 )
 
 
-def obtain_export_strategy(
-    settings: Settings,
-    model: Model,
-) -> ExportStrategy | None:
+def obtain_export_strategy(settings: Settings) -> ExportStrategy | None:
     """
     Gets the export strategy from settings or prompts the user.
-    Provides info to the user if the model is quantized on memory use.
     Returns an export strategy, or None if cancelled.
     """
-
-    if (
-        settings.quantization == QuantizationMethod.BNB_4BIT
-        and settings.export_strategy is None
-    ):
-        print()
-        print(
-            "The model was loaded with quantization. Merging requires reloading the base model."
-        )
-        print(
-            "[yellow]WARNING: CPU merging requires dequantizing the entire model to system RAM.[/]"
-        )
-        print("[yellow]This can lead to system freezes if you run out of memory.[/]")
-
-        try:
-            # Estimate memory requirements by loading the model structure on the "meta" device.
-            # This doesn't consume actual RAM but allows us to inspect the parameter count/dtype.
-            #
-            # Suppress warnings during meta device loading (e.g., "Some weights were not initialized").
-            # These are expected and harmless since we're only inspecting model structure, not running inference.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                meta_model = get_model_class(settings.model).from_pretrained(
-                    settings.model,
-                    device_map="meta",
-                    torch_dtype=torch.bfloat16,
-                    trust_remote_code=True
-                    if settings.model in model.trusted_models
-                    else None,
-                    **model.revision_kwargs,
-                )
-                footprint_bytes = meta_model.get_memory_footprint()
-                footprint_gb = footprint_bytes / (1024**3)
-                print(
-                    f"[yellow]Estimated RAM required (excluding overhead): [bold]~{footprint_gb:.2f} GB[/][/]"
-                )
-        except Exception:
-            # Fallback if meta loading fails (e.g. owing to custom model code
-            # or bitsandbytes quantization config issues on the meta device).
-            print(
-                "[yellow]Rule of thumb: You need approximately 3x the parameter count in GB RAM.[/]"
-            )
-            print(
-                "[yellow]Example: A 27B model requires ~80GB RAM. A 70B model requires ~200GB RAM.[/]"
-            )
-
-        print()
 
     return ask_if_unset(
         settings.export_strategy,
@@ -163,12 +108,7 @@ def obtain_export_strategy(
             "How do you want to export the model?",
             choices=[
                 Choice(
-                    title="Merge the abliteration LoRA and export the full model"
-                    + (
-                        ""
-                        if settings.quantization == QuantizationMethod.NONE
-                        else " (requires sufficient RAM)"
-                    ),
+                    title="Merge the abliteration LoRA and export the full model",
                     value=ExportStrategy.MERGE,
                 ),
                 Choice(
@@ -182,15 +122,8 @@ def obtain_export_strategy(
 
 
 def run():
-    # Enable expandable segments to reduce memory fragmentation on multi-GPU setups.
-    if (
-        "PYTORCH_ALLOC_CONF" not in os.environ
-        and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
-    ):
-        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
     # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/
-    print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-tpu')}")
+    print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  heretic-tpu v{version('heretic-tpu')}")
     print(
         "[cyan]█▀█░█▀▀░█▀▄░█▀▀░░█░░█░█░░[/]  [blue underline]https://heretic-project.org[/]"
     )
@@ -251,12 +184,10 @@ def run():
 
         if reproduction_information["version"] != "4":
             print(
-                (
-                    f"[red]Unsupported file format version: [bold]{reproduction_information['version']}[/].[/] "
-                    "This version of Heretic reads version 4 (plugin-based) reproduce.json files. "
-                    "Older files were produced before the introduction of the plugin system and are not supported. "
-                    "Please install Heretic 1.4 to use these files."
-                )
+                f"[red]Unsupported file format version: [bold]{reproduction_information['version']}[/].[/] "
+                "heretic-tpu reads version 4 (plugin-based) reproduce.json files. "
+                "Older files were produced before the introduction of the plugin system and are not supported. "
+                "Please install Heretic 1.4 to use these files."
             )
             return
 
@@ -270,30 +201,18 @@ def run():
     if settings.seed is None:
         settings.seed = random.randint(0, 2**32 - 1)
 
-    transformers.set_seed(settings.seed)
+    # transformers.set_seed would import PyTorch to seed it as well. JAX has no global
+    # random state: the model derives its random keys from the seed.
+    random.seed(settings.seed)
+    np.random.seed(settings.seed)
 
     print(get_accelerator_info())
 
     if settings.print_debug_information:
         print()
-        print(torch.__config__.show().strip())
+        print(escape(cast(str, jax.print_environment_info(return_string=True)).strip()))
         print()
-        print(
-            f"torch.backends.mkldnn.enabled = [bold]{torch.backends.mkldnn.enabled}[/]"
-        )
-        print(f"torch.get_num_threads() = [bold]{torch.get_num_threads()}[/]")
-        print(
-            f"torch.get_num_interop_threads() = [bold]{torch.get_num_interop_threads()}[/]"
-        )
-
-    # We don't need gradients as we only do inference.
-    torch.set_grad_enabled(False)
-
-    # While determining the optimal batch size, we will try many different batch sizes,
-    # resulting in many computation graphs being compiled. Raising the limit (default = 8)
-    # avoids errors from TorchDynamo assuming that something is wrong because we
-    # recompile too often.
-    torch._dynamo.config.cache_size_limit = 64
+        print(f"jax.devices() = [bold]{escape(repr(jax.devices()))}[/]")
 
     # Silence warning spam from Transformers.
     # In my entire career I've never seen a useful warning from that library.
@@ -339,12 +258,10 @@ def run():
             if settings.checkpoint_action is None:
                 print()
                 print(
-                    (
-                        "[green]You have already processed this model.[/] "
-                        "You can show the results from the previous run, allowing you to export models or to run additional trials. "
-                        "Alternatively, you can ignore the previous run and start from scratch. "
-                        "This will delete the checkpoint file and all results from the previous run."
-                    )
+                    "[green]You have already processed this model.[/] "
+                    "You can show the results from the previous run, allowing you to export models or to run additional trials. "
+                    "Alternatively, you can ignore the previous run and start from scratch. "
+                    "This will delete the checkpoint file and all results from the previous run."
                 )
 
             choices.append(
@@ -357,12 +274,10 @@ def run():
             if settings.checkpoint_action is None:
                 print()
                 print(
-                    (
-                        "[yellow]You have already processed this model, but the run was interrupted.[/] "
-                        "You can continue the previous run from where it stopped. This will override any specified settings. "
-                        "Alternatively, you can ignore the previous run and start from scratch. "
-                        "This will delete the checkpoint file and all results from the previous run."
-                    )
+                    "[yellow]You have already processed this model, but the run was interrupted.[/] "
+                    "You can continue the previous run from where it stopped. This will override any specified settings. "
+                    "Alternatively, you can ignore the previous run and start from scratch. "
+                    "This will delete the checkpoint file and all results from the previous run."
                 )
 
             choices.append(
@@ -410,6 +325,10 @@ def run():
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
             storage = JournalStorage(backend)
 
+    # This must happen before the model compiles anything, and after settings
+    # have been restored from a previous run, which don't contain the cache directory.
+    configure_compilation_cache(settings.compilation_cache_dir)
+
     model = Model(settings)
     print()
     print_memory_usage()
@@ -448,6 +367,11 @@ def run():
                 responses = model.get_responses(prompts)
                 end_time = time.perf_counter()
             except Exception as error:
+                if not is_out_of_memory(error):
+                    # Only running out of device memory means that the batch size
+                    # is too large. Any other error is a genuine failure.
+                    raise
+
                 if batch_size == 1:
                     # Even a batch size of 1 already fails.
                     # We cannot recover from this.
@@ -771,12 +695,10 @@ def run():
             if settings.trial_index is None:
                 print()
                 print(
-                    (
-                        "The following trials resulted in Pareto optimal combinations of the optimization objectives. "
-                        "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
-                        "chat with it to test how well it works, or run standard benchmarks on it. "
-                        "You can return to this menu later to select a different trial. "
-                    )
+                    "The following trials resulted in Pareto optimal combinations of the optimization objectives. "
+                    "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
+                    "chat with it to test how well it works, or run standard benchmarks on it. "
+                    "You can return to this menu later to select a different trial. "
                 )
 
         while trial_loop_active:
@@ -861,20 +783,14 @@ def run():
             for name, value in modifier.render_trial_parameters(trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
 
-            # Per https://github.com/huggingface/peft/issues/868#issuecomment-1820642893
-            # once a LoRA is merged it's expected to be empty. Provide a utility function
-            # to restore the previous LoRA-ified state.
-            def reset_trial_model():
-                ctx = Context(settings=settings, model=model)
-                print("* Resetting model...")
-                modifier.reset_model(ctx)
-                print(f"* Modifying model using {modifier_name}...")
-                parameters = modifier.parameters_class.from_dict(
-                    trial.user_attrs["parameters"]
-                )
-                modifier.modify_model(ctx, parameters)
-
-            reset_trial_model()
+            ctx = Context(settings=settings, model=model)
+            print("* Resetting model...")
+            modifier.reset_model(ctx)
+            print(f"* Modifying model using {modifier_name}...")
+            parameters = modifier.parameters_class.from_dict(
+                trial.user_attrs["parameters"]
+            )
+            modifier.modify_model(ctx, parameters)
 
             action_loop_active = True
 
@@ -940,29 +856,18 @@ def run():
                             if not save_directory:
                                 continue
 
-                            strategy = obtain_export_strategy(settings, model)
+                            strategy = obtain_export_strategy(settings)
                             if strategy is None:
                                 continue
 
+                            # Exporting doesn't modify the model in memory,
+                            # so it doesn't have to be restored afterwards.
                             if strategy == ExportStrategy.ADAPTER:
                                 print("Saving LoRA adapter...")
-                                model.model.save_pretrained(
-                                    save_directory,
-                                    max_shard_size=settings.max_shard_size,
-                                )
+                                model.save_adapter(save_directory)
                             else:
                                 print("Saving merged model...")
-                                merged_model = model.get_merged_model()
-                                merged_model.save_pretrained(
-                                    save_directory,
-                                    max_shard_size=settings.max_shard_size,
-                                )
-                                del merged_model
-                                empty_cache()
-                                model.tokenizer.save_pretrained(save_directory)
-                                if model.processor is not None:
-                                    model.processor.save_pretrained(save_directory)
-                                reset_trial_model()
+                                model.save_merged(save_directory)
 
                             print(f"Model saved to [bold]{save_directory}[/].")
 
@@ -993,7 +898,7 @@ def run():
 
                         case "upload":
                             # We don't use huggingface_hub.login() because that stores the token on disk,
-                            # and since this program will often be run on rented or shared GPU servers,
+                            # and since this program will often be run on rented or shared TPU VMs,
                             # it's better to not persist credentials.
                             token = huggingface_hub.get_token()
                             if not token:
@@ -1047,7 +952,7 @@ def run():
                                 continue
                             private = visibility == "Private"
 
-                            strategy = obtain_export_strategy(settings, model)
+                            strategy = obtain_export_strategy(settings)
                             if strategy is None:
                                 continue
 
@@ -1077,13 +982,11 @@ def run():
                             if is_reproducible:
                                 if settings.upload_reproducibility_information is None:
                                     print(
-                                        (
-                                            "Heretic can add information to the repository that allows others to reproduce the model. "
-                                            "This is optional, but valuable to the community as both a learning tool and to preserve computational work already done. "
-                                            "Guaranteeing reproducibility requires basic system information (Python and OS version, CPU and GPU/accelerator info) "
-                                            "as tensor operations can give different results in different system environments. "
-                                            "[bold]The information does not include any file system paths or other private data.[/]"
-                                        )
+                                        "heretic-tpu can add information to the repository that allows others to reproduce the model. "
+                                        "This is optional, but valuable to the community as both a learning tool and to preserve computational work already done. "
+                                        "Guaranteeing reproducibility requires basic system information (Python and OS version, CPU and TPU/accelerator info) "
+                                        "as tensor operations can give different results in different system environments. "
+                                        "[bold]The information does not include any file system paths or other private data.[/]"
                                     )
 
                                 reproducibility_information = ask_if_unset(
@@ -1114,35 +1017,15 @@ def run():
 
                             if strategy == ExportStrategy.ADAPTER:
                                 print("Uploading LoRA adapter...")
-                                model.model.push_to_hub(
-                                    repo_id,
-                                    private=private,
-                                    max_shard_size=settings.max_shard_size,
-                                    token=token,
-                                )
                             else:
                                 print("Uploading merged model...")
-                                merged_model = model.get_merged_model()
-                                merged_model.push_to_hub(
-                                    repo_id,
-                                    private=private,
-                                    max_shard_size=settings.max_shard_size,
-                                    token=token,
-                                )
-                                del merged_model
-                                empty_cache()
-                                model.tokenizer.push_to_hub(
-                                    repo_id,
-                                    private=private,
-                                    token=token,
-                                )
-                                if model.processor is not None:
-                                    model.processor.push_to_hub(
-                                        repo_id,
-                                        private=private,
-                                        token=token,
-                                    )
-                                reset_trial_model()
+
+                            model.push_to_hub(
+                                repo_id,
+                                private=private,
+                                token=token,
+                                strategy=strategy,
+                            )
 
                             if is_hf_path(settings.model):
                                 card = ModelCard.load(settings.model)
@@ -1318,11 +1201,14 @@ def run():
                                 continue
                             benchmark_original_model = scope == "Benchmark both models"
 
-                            hflm = HFLM(
-                                pretrained=model.model,  # ty:ignore[invalid-argument-type]
-                                tokenizer=model.tokenizer,  # ty:ignore[invalid-argument-type]
-                                batch_size="auto",
-                            )
+                            # Imported on first use, so that runs without benchmarks
+                            # don't load the lm-eval model API.
+                            from .backend.lm_eval_adapter import JaxLM
+
+                            # JaxLM fetches the model's current state on every request,
+                            # so it also benchmarks the original model while adapters
+                            # are disabled.
+                            lm = JaxLM(model.tokenizer, model.lm_eval_state)
 
                             table = Table()
                             table.add_column("Benchmark")
@@ -1341,17 +1227,23 @@ def run():
                                         f"Running benchmark [bold]{benchmark.name}[/]..."
                                     )
 
-                                    def get_results() -> dict[str, Any]:
+                                    def get_results(
+                                        lm: JaxLM,
+                                        task: str,
+                                    ) -> dict[str, Any]:
                                         results = lm_eval.simple_evaluate(
-                                            model=hflm,
-                                            tasks=[benchmark.task],
+                                            model=lm,
+                                            tasks=[task],
                                         )
-                                        return results["results"][benchmark.task]
+                                        return results["results"][task]
 
-                                    results = get_results()
+                                    results = get_results(lm, benchmark.task)
                                     if benchmark_original_model:
-                                        with model.model.disable_adapter():  # ty:ignore[call-non-callable]
-                                            original_results = get_results()
+                                        with model.lora_disabled():
+                                            original_results = get_results(
+                                                lm,
+                                                benchmark.task,
+                                            )
 
                                     first_row = True
 
@@ -1396,7 +1288,7 @@ def run():
                             if table.rows:
                                 print(table)
 
-                except Exception as error:
+                except Exception as error:  # noqa: BLE001
                     formatted = format_exception(error)
                     if "\n" in formatted:
                         print(f"[red]Error:\n{formatted}[/]")

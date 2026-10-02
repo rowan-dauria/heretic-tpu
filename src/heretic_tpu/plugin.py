@@ -11,11 +11,10 @@ from types import ModuleType
 from typing import Annotated, Any, TypeVar, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel
-from torch import Tensor
 
 from .config import DatasetSpecification, SingleDatasetSpecification
 from .config import Settings as HereticSettings
-from .model import Model
+from .model import Array, Model
 from .utils import Prompt, deep_merge_dicts, load_prompts
 
 T = TypeVar("T")
@@ -186,10 +185,10 @@ class Context:
             )
         return self._responses_cache[key]
 
-    def get_logits(self, prompts: list[Prompt]) -> Tensor:
+    def get_logits(self, prompts: list[Prompt]) -> Array:
         return self._model.get_logits_batched(prompts)
 
-    def get_residuals(self, prompts: list[Prompt]) -> Tensor:
+    def get_residuals(self, prompts: list[Prompt]) -> Array:
         return self._model.get_residuals_batched(prompts)
 
     def get_model(self) -> Model:
@@ -378,4 +377,3 @@ class Plugin:
         Override this in subclasses to do one-time setup (e.g. load prompts, compute
         baselines).
         """
-        return None
