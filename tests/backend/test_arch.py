@@ -10,6 +10,7 @@ import json
 
 import numpy as np
 import pytest
+from huggingface_hub import constants as hf_constants
 from safetensors.numpy import save_file
 from transformers import (
     AutoConfig,
@@ -211,6 +212,21 @@ def test_tied_head() -> None:
     assert tied.tied_head
     assert tied != arch
     assert dataclasses.replace(arch, tied_head=True) == tied
+
+
+def test_real_tensor_index_is_cached_on_disk(tmp_path, monkeypatch) -> None:
+    repo_id = "Qwen/Qwen3-0.6B"
+    expected = real_tensor_index(repo_id)
+
+    # Once cached (by the call above, if not before), reading the tensor index needs
+    # no Hub access, so that the default test selection can run offline.
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+    assert real_tensor_index.__wrapped__(repo_id) == expected
+
+    # Otherwise, the error says how to fill the cache.
+    monkeypatch.setattr(hf_constants, "HF_ASSETS_CACHE", str(tmp_path))
+    with pytest.raises(RuntimeError, match="OfflineModeIsEnabled.*Run the tests once"):
+        real_tensor_index.__wrapped__(repo_id)
 
 
 def test_multimodal() -> None:

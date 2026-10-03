@@ -4,13 +4,13 @@
 """
 Tiny random-weight checkpoints for the backend tests.
 
-Checkpoints are built from the resolved configurations of real models (only
-config.json is downloaded, and cached by huggingface_hub), shrunk to a few narrow
-layers, instantiated with transformers 5 and written with `save_pretrained`. The files
-on disk are therefore exactly what transformers writes, including the legacy
-"language_model.model.*" layout of the gemma3 and mistral3 wrappers. Building a
-checkpoint needs torch; tests that use this module should start with
-`pytest.importorskip("torch")`.
+Checkpoints are built from the resolved configurations of real models at pinned
+commits (only config.json is downloaded, and cached by huggingface_hub), shrunk to a
+few narrow layers, instantiated with transformers 5 and written with
+`save_pretrained`. The files on disk are therefore exactly what transformers writes,
+including the legacy "language_model.model.*" layout of the gemma3 and mistral3
+wrappers. Building a checkpoint needs torch; tests that use this module should start
+with `pytest.importorskip("torch")`.
 
 Import with `from tests.backend.tiny import ...`.
 
@@ -25,6 +25,11 @@ API
     Phi-4-mini: partial rotary, longrope, tied), "phi3_4k" (Phi-3-mini-4k: sliding
     window), "qwen3_moe" and "mixtral" (mixtures of experts).
 
+`REVISIONS: dict[str, str]`
+    Hub id -> the commit that the functions below read the model at, so that its
+    configuration and tensor index cannot drift apart, and the tests do not change
+    when the repository does. Every model they are called with must be pinned here.
+
 `real_config(repo_id, **text_overrides) -> PretrainedConfig`
     The configuration of a Hub model as AutoConfig resolves it, optionally with
     `text_overrides` applied to the text config dict before resolution (for example
@@ -34,8 +39,11 @@ API
     The parsed config.json of a Hub model.
 
 `real_tensor_index(repo_id) -> TensorIndex`
-    The tensor index of a Hub model, built from the safetensors headers fetched with
-    HTTP range requests (no weights are downloaded).
+    The tensor index of a Hub model, built from the safetensors headers. The headers
+    are fetched once with HTTP range requests (no weights are downloaded) and cached
+    on disk under huggingface_hub's assets cache (`HF_ASSETS_CACHE`), so that, like
+    the configurations, they need the Hub only on the first run (raising a
+    RuntimeError if it cannot be reached then).
 
 `real_arch(repo_id, **text_overrides) -> ArchConfig`
     The ArchConfig of a Hub model at full size, built from
@@ -90,15 +98,18 @@ tie_word_embeddings=None, max_shard_size=None, edit_config=None) -> Path`
     Serves local directories (`repos`: Hub id -> directory) as Hub repositories,
     downloading into snapshot directories under `root`, for code that calls
     `HfApi().model_info` and `snapshot_download`, and records every downloaded file
-    in `downloads` (a list of (repo_id, filename)). `install(monkeypatch, *modules)`
-    replaces the `HfApi` and `snapshot_download` names in the given modules (by
-    default heretic_tpu.backend.weights). Each repository has a single commit:
-    `shas[repo_id]` if given, otherwise `FakeHub.SHA`.
+    in `downloads` (a list of (repo_id, filename)) and the revision every
+    snapshot_download call asks for in `revisions` (a list of (repo_id, revision)).
+    `install(monkeypatch, *modules)` replaces the `HfApi` and `snapshot_download`
+    names in the given modules (by default heretic_tpu.backend.weights). Each
+    repository has a single commit: `shas[repo_id]` if given, otherwise
+    `FakeHub.SHA`, which the revisions None and "main" resolve to.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from collections.abc import Callable
 from functools import cache
@@ -106,6 +117,9 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import httpx
+from huggingface_hub import constants
+from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
 from huggingface_hub.utils import filter_repo_objects
 from transformers import AutoConfig, PretrainedConfig
 
@@ -127,13 +141,44 @@ REAL_MODELS: dict[str, str] = {
     "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
 }
 
+REVISIONS: dict[str, str] = {
+    "unsloth/Llama-3.2-1B-Instruct": "5a8abab4a5d6f164389b1079fb721cfab8d7126c",
+    "mistralai/Mistral-7B-Instruct-v0.3": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+    "Qwen/Qwen2.5-0.5B-Instruct": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "Qwen/Qwen2.5-32B-Instruct": "5ede1c97bbab6ce5cda5812749b4c0bdf79b18dd",
+    "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca",
+    "Qwen/Qwen3-4B-Instruct-2507": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "Qwen/Qwen3-30B-A3B": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+    "unsloth/gemma-3-1b-it": "5b11413a10db4e486ef16a20101fd028f8f2499c",
+    "unsloth/gemma-3-4b-it": "bf46152c47f5dd20b896357cb51abc4c03b8ee8c",
+    "mistralai/Mistral-Small-3.1-24B-Instruct-2503": (
+        "68faf511d618ef198fef186659617cfd2eb8e33a"
+    ),
+    "mistralai/Ministral-3-3B-Instruct-2512-BF16": (
+        "b6d637bef2393152b3da2b2fde72eecdee30557e"
+    ),
+    "microsoft/Phi-3-mini-4k-instruct": "f39ac1d28e925b323eae81227eaba4464caced4e",
+    "microsoft/Phi-3.5-mini-instruct": "2fe192450127e6a83f7441aef6e3ca586c338b77",
+    "microsoft/Phi-4-mini-instruct": "cfbefacb99257ffa30c83adab238a50856ac3083",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": "eba92302a2861cdc0098cc54bc9f17cb2c47eb61",
+}
+
 # Small replacements for token ids that do not fit into a reduced vocabulary.
 _TOKEN_IDS = {"pad_token_id": 0, "bos_token_id": 1, "eos_token_id": 2}
 
 
+def _revision(repo_id: str) -> str:
+    try:
+        return REVISIONS[repo_id]
+    except KeyError:
+        raise KeyError(
+            f"Pin a commit of {repo_id} in tests.backend.tiny.REVISIONS."
+        ) from None
+
+
 @cache
 def _real_config_dict(repo_id: str) -> dict[str, Any]:
-    return AutoConfig.from_pretrained(repo_id).to_dict()
+    return AutoConfig.from_pretrained(repo_id, revision=_revision(repo_id)).to_dict()
 
 
 def real_config(repo_id: str, **text_overrides: Any) -> PretrainedConfig:
@@ -152,19 +197,58 @@ def _without_model_type(config: dict[str, Any]) -> dict[str, Any]:
 def real_raw_config(repo_id: str) -> dict[str, Any]:
     from huggingface_hub import hf_hub_download
 
-    return json.loads(Path(hf_hub_download(repo_id, "config.json")).read_text())
+    path = hf_hub_download(repo_id, "config.json", revision=_revision(repo_id))
+    return json.loads(Path(path).read_text())
 
 
 @cache
 def real_tensor_index(repo_id: str) -> TensorIndex:
-    from huggingface_hub import get_safetensors_metadata
+    from huggingface_hub import cached_assets_path
+
+    revision = _revision(repo_id)
+    # The assets directory is read when called, so that tests can redirect it.
+    path = cached_assets_path(
+        "heretic-tpu-tests",
+        namespace=repo_id,
+        subfolder="tensor-index",
+        assets_dir=constants.HF_ASSETS_CACHE,
+    ) / (revision + ".json")
+
+    try:
+        # Key -> [shard, shape, dtype].
+        entries = json.loads(path.read_text())
+    except FileNotFoundError:
+        entries = _fetch_tensor_entries(repo_id, revision, path)
+        # Atomically, as several test processes may share the cache.
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(entries))
+        os.replace(temporary, path)
 
     tensors = {
-        key: TensorInfo(shard=shard, shape=tuple(info.shape), dtype=info.dtype)
-        for shard, metadata in get_safetensors_metadata(repo_id).files_metadata.items()
-        for key, info in metadata.tensors.items()
+        key: TensorInfo(shard=shard, shape=tuple(shape), dtype=dtype)
+        for key, (shard, shape, dtype) in entries.items()
     }
     return TensorIndex.from_infos(repo_id, tensors, real_config(repo_id))
+
+
+def _fetch_tensor_entries(repo_id: str, revision: str, path: Path) -> dict[str, Any]:
+    from huggingface_hub import get_safetensors_metadata
+
+    try:
+        metadata = get_safetensors_metadata(repo_id, revision=revision)
+    except (OfflineModeIsEnabled, httpx.HTTPError, HfHubHTTPError) as error:
+        raise RuntimeError(
+            f"The tensor index of {repo_id} at commit {revision} is not cached in "
+            f"{path}, and reading the safetensors headers from the Hugging Face Hub "
+            f"failed ({type(error).__name__}: {error}). Run the tests once with "
+            "access to the Hub to cache it."
+        ) from error
+
+    return {
+        key: [shard, list(info.shape), info.dtype]
+        for shard, shard_metadata in metadata.files_metadata.items()
+        for key, info in shard_metadata.tensors.items()
+    }
 
 
 def real_arch(repo_id: str, **text_overrides: Any) -> ArchConfig:
@@ -375,9 +459,15 @@ class FakeHub:
         self.repos = {repo_id: Path(path) for repo_id, path in repos.items()}
         self.shas = shas or {}
         self.downloads: list[tuple[str, str]] = []
+        self.revisions: list[tuple[str, str | None]] = []
 
     def sha(self, repo_id: str) -> str:
         return self.shas.get(repo_id, self.SHA)
+
+    def _resolve(self, repo_id: str, revision: str | None) -> str:
+        if revision not in (None, "main", self.sha(repo_id)):
+            raise ValueError(f"Unknown revision: {revision}")
+        return self.sha(repo_id)
 
     def _files(self, repo_id: str) -> list[str]:
         repo = self.repos[repo_id]
@@ -388,10 +478,8 @@ class FakeHub:
         )
 
     def model_info(self, repo_id: str, revision: str | None = None, **kwargs: Any):
-        if revision not in (None, "main", self.sha(repo_id)):
-            raise ValueError(f"Unknown revision: {revision}")
         return SimpleNamespace(
-            sha=self.sha(repo_id),
+            sha=self._resolve(repo_id, revision),
             siblings=[SimpleNamespace(rfilename=name) for name in self._files(repo_id)],
         )
 
@@ -402,8 +490,11 @@ class FakeHub:
         allow_patterns: list[str] | str | None = None,
         **kwargs: Any,
     ) -> str:
-        assert revision == self.sha(repo_id), "downloads must use the resolved commit"
-        snapshot = self.root / repo_id.replace("/", "--") / revision
+        self.revisions.append((repo_id, revision))
+        # Like the Hub cache, the snapshot directory is named after the commit.
+        snapshot = (
+            self.root / repo_id.replace("/", "--") / self._resolve(repo_id, revision)
+        )
         snapshot.mkdir(parents=True, exist_ok=True)
 
         for name in filter_repo_objects(
