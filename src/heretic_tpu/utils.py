@@ -715,14 +715,30 @@ def create_reproduce_folder(
     trial: Trial | FrozenTrial,
     uploaded_model_hashes: dict[str, str],
     include_system_information: bool,
+    model_commit: str | None,
 ):
+    """
+    Writes the reproducibility files to `path`/reproduce. `model_commit` is the full
+    commit hash of the base model that was loaded; if it is None, the commit that
+    settings.model_commit (or the default branch) currently resolves to is used.
+    """
+
     reproduce_dir = path / "reproduce"
     reproduce_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_filename = Path(checkpoint_path).name
 
-    # Fetch commit hash for the base model.
-    settings.model_commit = huggingface_hub.model_info(settings.model).sha
+    # Upstream records the current head of the default branch here, which is not
+    # the commit that was loaded if settings.model_commit pins another one or the
+    # repository has received commits since. It also overwrites the live settings,
+    # from which adapters saved later in the session take their base revision.
+    # The files are therefore written from a copy that names the loaded commit.
+    if model_commit is None:
+        model_commit = huggingface_hub.model_info(
+            settings.model,
+            revision=settings.model_commit,
+        ).sha
+    settings = settings.model_copy(update={"model_commit": model_commit})
 
     # Strip microseconds and timezone for a clean format.
     timestamp = datetime.now(UTC).replace(microsecond=0, tzinfo=None).isoformat()
@@ -779,6 +795,7 @@ def upload_reproduce_folder(
     checkpoint_path: str | Path,
     trial: Trial | FrozenTrial,
     include_system_information: bool,
+    model_commit: str | None,
 ):
     api = huggingface_hub.HfApi()
     info = api.model_info(repo_id=repo_id, files_metadata=True, token=token)
@@ -808,6 +825,7 @@ def upload_reproduce_folder(
             trial=trial,
             uploaded_model_hashes=uploaded_model_hashes,
             include_system_information=include_system_information,
+            model_commit=model_commit,
         )
 
         reproduce_dir = tmp_path / "reproduce"

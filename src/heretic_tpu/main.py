@@ -1085,6 +1085,9 @@ def run():
                                         include_system_information=(
                                             reproducibility_information == "full"
                                         ),
+                                        # The commit that was loaded, which a pinned
+                                        # branch, tag or short hash resolved to.
+                                        model_commit=model.checkpoint.sha,
                                     )
                                 finally:
                                     settings.export_strategy = current_export_strategy

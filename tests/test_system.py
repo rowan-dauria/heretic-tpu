@@ -3,10 +3,12 @@
 
 import gc
 import importlib.metadata
+import json
 import os
 import subprocess
 import sys
 import textwrap
+import tomllib
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,18 +16,24 @@ from typing import Any
 
 import jax
 import pytest
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 
 from heretic_tpu import system
+from heretic_tpu.config import Settings
 from heretic_tpu.system import (
     configure_compilation_cache,
     empty_cache,
     get_accelerator_info,
     get_accelerator_info_dict,
+    get_heretic_version_info,
     get_libtpu_version,
     get_requirements_dict,
 )
 
 GiB = 1024**3
+
+PYPROJECT = Path(__file__).parents[1] / "pyproject.toml"
 
 
 @dataclass
@@ -222,6 +230,132 @@ def test_requirements_skip_missing_libtpu(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert "libtpu" not in requirements
     assert "jax" in requirements
+
+
+def test_dependency_bounds_exclude_untested_versions() -> None:
+    project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
+    requirements = {
+        requirement.name: requirement
+        for requirement in map(Requirement, project["dependencies"])
+    }
+    [tpu_requirement] = map(Requirement, project["optional-dependencies"]["tpu"])
+
+    # jax 0.11 needs Python 3.12. Earlier jax releases compile abliteration with
+    # more than one module in flight, and lm-eval releases before 0.4.13 lack
+    # helpers that the JaxLM adapter imports.
+    assert not SpecifierSet(project["requires-python"]).contains("3.11.9")
+    for name, oldest_supported, newest_unsupported in [
+        ("jax", "0.11.2", "0.11.1"),
+        ("lm-eval", "0.4.13", "0.4.12"),
+    ]:
+        specifier = requirements[name].specifier
+        assert specifier.contains(oldest_supported)
+        assert not specifier.contains(newest_unsupported)
+        assert specifier.contains(importlib.metadata.version(name))
+    assert tpu_requirement.specifier == requirements["jax"].specifier
+
+
+def test_dependencies_of_default_benchmarks_are_installed() -> None:
+    # lm-eval lists the dependencies of some tasks only under an extra named after
+    # the task, such as IFEval's langdetect and immutabledict, so heretic-tpu has
+    # to depend on them itself.
+    tasks = {
+        benchmark.task
+        for benchmark in Settings.model_fields["benchmarks"].get_default(
+            call_default_factory=True
+        )
+    }
+    extras = set(importlib.metadata.metadata("lm-eval").get_all("Provides-Extra") or [])
+    assert "ifeval" in tasks & extras
+
+    checked = set()
+    for requirement in map(Requirement, importlib.metadata.requires("lm-eval") or []):
+        marker = requirement.marker
+        if marker is None or "extra" not in str(marker):
+            continue
+        for task in tasks & extras:
+            if marker.evaluate({"extra": task}):
+                version = importlib.metadata.version(requirement.name)
+                assert requirement.specifier.contains(version, prereleases=True), (
+                    requirement,
+                    version,
+                )
+                checked.add(requirement.name)
+
+    assert {"immutabledict", "langdetect"} <= checked
+
+
+class FakeInstallation:
+    """A heretic-tpu distribution with the given direct_url.json (None if absent)."""
+
+    def __init__(self, direct_url: dict[str, Any] | None):
+        self.version = "0.1.0"
+        self.direct_url = direct_url
+
+    def read_text(self, filename: str) -> str | None:
+        if filename == "direct_url.json" and self.direct_url is not None:
+            return json.dumps(self.direct_url)
+        return None
+
+
+@pytest.mark.parametrize(
+    ("direct_url", "origin", "metadata"),
+    [
+        (None, "PyPI", {"type": "pypi"}),
+        (
+            {
+                "url": "https://github.com/user/heretic-tpu.git",
+                "vcs_info": {"vcs": "git", "commit_id": "abc123"},
+            },
+            "Git (https://github.com/user/heretic-tpu.git @ abc123)",
+            {
+                "type": "git",
+                "url": "https://github.com/user/heretic-tpu.git",
+                "commit_hash": "abc123",
+                "requested_revision": None,
+            },
+        ),
+        (
+            {"url": "file:///home/user/heretic-tpu", "dir_info": {"editable": True}},
+            "Local",
+            {"type": "local"},
+        ),
+        # An archive, as `pip install https://.../archive/main.zip` records it.
+        ({"url": "https://example.com/main.zip", "archive_info": {}}, None, {}),
+        # Another version control system.
+        (
+            {
+                "url": "https://example.com/heretic-tpu",
+                "vcs_info": {"vcs": "hg", "commit_id": "abc123"},
+            },
+            None,
+            {},
+        ),
+    ],
+)
+def test_heretic_version_info(
+    monkeypatch: pytest.MonkeyPatch,
+    direct_url: dict[str, Any] | None,
+    origin: str | None,
+    metadata: dict[str, Any],
+) -> None:
+    distribution = importlib.metadata.distribution
+
+    def fake_distribution(name: str) -> Any:
+        if name == "heretic-tpu":
+            return FakeInstallation(direct_url)
+        return distribution(name)
+
+    monkeypatch.setattr(importlib.metadata, "distribution", fake_distribution)
+
+    version_info = get_heretic_version_info()
+
+    assert version_info.version == "0.1.0"
+    assert version_info.origin == origin
+    assert version_info.is_standard_pypi == (origin == "PyPI")
+    # An unknown origin has no "type", which the readers of reproduce.json files,
+    # here and in upstream Heretic, accept.
+    assert version_info.metadata == metadata
 
 
 def test_configure_compilation_cache_sets_and_clears_directory(

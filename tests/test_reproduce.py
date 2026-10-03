@@ -2,7 +2,10 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import importlib
+import importlib.metadata
 import json
+import tomllib
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,9 +18,14 @@ from heretic_tpu.config import Settings, SingleDatasetSpecification
 from heretic_tpu.reproduce import (
     MismatchSeverity,
     check_environment,
+    format_version_information,
     get_package_mismatch_severity,
 )
-from heretic_tpu.system import HereticVersionInfo, get_libtpu_version
+from heretic_tpu.system import (
+    HereticVersionInfo,
+    get_heretic_version_info,
+    get_libtpu_version,
+)
 from heretic_tpu.utils import generate_reproduce_json, generate_reproduce_readme
 
 UPSTREAM_SOURCE = Path(__file__).parents[1] / "heretic" / "src"
@@ -229,6 +237,92 @@ def test_generate_reproduce_readme_warns_about_mixed_devices(
     assert "**Heterogeneous accelerators**" in make_reproduce_readme()
 
 
+LOADED_COMMIT = "699cc3f2b1e4c7d5a8f9e0b1c2d3e4f5a6b7c8d9"
+HEAD_COMMIT = "84ad45b0f1e2d3c4b5a69788796a5b4c3d2e1f00"
+
+
+def write_reproduce_folder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    model_commit: str | None,
+) -> tuple[Path, list[dict[str, Any]]]:
+    """
+    Calls utils.create_reproduce_folder with a Hub whose default branch is at
+    HEAD_COMMIT and on which every other revision resolves to LOADED_COMMIT.
+    Returns the folder and the arguments of every model_info call.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def model_info(repo_id: str, revision: str | None = None) -> SimpleNamespace:
+        calls.append({"repo_id": repo_id, "revision": revision})
+        return SimpleNamespace(sha=HEAD_COMMIT if revision is None else LOADED_COMMIT)
+
+    monkeypatch.setattr(utils.huggingface_hub, "model_info", model_info)
+
+    journal = tmp_path / "Qwen--Qwen3-0.6B.jsonl"
+    journal.write_text("{}\n", encoding="utf-8")
+
+    utils.create_reproduce_folder(
+        tmp_path,
+        settings,
+        [],
+        checkpoint_path=journal,
+        trial=make_trial(),
+        uploaded_model_hashes={"model.safetensors": "0" * 64},
+        include_system_information=False,
+        model_commit=model_commit,
+    )
+
+    return tmp_path / "reproduce", calls
+
+
+def assert_reproduce_folder_records(reproduce_dir: Path, commit: str) -> None:
+    data = json.loads((reproduce_dir / "reproduce.json").read_text(encoding="utf-8"))
+    assert data["settings"]["model_commit"] == commit
+
+    config = tomllib.loads((reproduce_dir / "config.toml").read_text(encoding="utf-8"))
+    assert config["model_commit"] == commit
+
+    readme = (reproduce_dir / "README.md").read_text(encoding="utf-8")
+    assert f"/commit/{commit})" in readme
+
+
+def test_create_reproduce_folder_records_the_loaded_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The model was loaded from a branch that resolved to LOADED_COMMIT, while the
+    # default branch has moved on to HEAD_COMMIT.
+    settings = make_settings(model_commit="v1.0")
+
+    reproduce_dir, calls = write_reproduce_folder(
+        tmp_path, monkeypatch, settings, LOADED_COMMIT
+    )
+
+    assert_reproduce_folder_records(reproduce_dir, LOADED_COMMIT)
+    assert calls == []
+    # The live settings, from which adapters record their base model revision,
+    # are left alone.
+    assert settings.model_commit == "v1.0"
+
+
+@pytest.mark.parametrize("model_commit", [None, "699cc3f"])
+def test_create_reproduce_folder_resolves_the_pinned_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_commit: str | None,
+) -> None:
+    settings = make_settings(model_commit=model_commit)
+
+    reproduce_dir, calls = write_reproduce_folder(tmp_path, monkeypatch, settings, None)
+
+    commit = HEAD_COMMIT if model_commit is None else LOADED_COMMIT
+    assert_reproduce_folder_records(reproduce_dir, commit)
+    assert calls == [{"repo_id": "Qwen/Qwen3-0.6B", "revision": model_commit}]
+    assert settings.model_commit == model_commit
+
+
 @pytest.mark.parametrize("include_system_information", [True, False])
 def test_generate_reproduce_json(include_system_information: bool) -> None:
     data = make_reproduce_json(include_system_information)
@@ -286,6 +380,63 @@ def test_check_environment_accepts_own_reproduce_json(
     settings = Settings.model_validate(data["settings"])
     assert settings.seed == 1234
     assert capsys.readouterr().out == ""
+
+
+class ArchiveInstallation:
+    """The installed heretic-tpu distribution, as if installed from an archive URL."""
+
+    def __init__(self, distribution: importlib.metadata.Distribution):
+        self.distribution = distribution
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.distribution, name)
+
+    def read_text(self, filename: str) -> str | None:
+        if filename == "direct_url.json":
+            # As `pip install https://.../archive/main.zip` records it.
+            return json.dumps(
+                {"url": "https://example.com/main.zip", "archive_info": {}}
+            )
+        return self.distribution.read_text(filename)
+
+
+@pytest.mark.parametrize("metadata", [None, {"type": "unknown"}])
+def test_check_environment_accepts_unknown_installation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    metadata: dict[str, Any] | None,
+) -> None:
+    distribution = importlib.metadata.distribution
+
+    def fake_distribution(name: str) -> Any:
+        if name == "heretic-tpu":
+            return ArchiveInstallation(distribution(name))
+        return distribution(name)
+
+    monkeypatch.setattr(importlib.metadata, "distribution", fake_distribution)
+
+    data = make_reproduce_json()
+    if metadata is not None:
+        # Upstream Heretic and earlier versions of heretic-tpu record this.
+        data["environment"]["heretic"]["metadata"] = metadata
+
+    # Like a local installation, an installation of unknown origin cannot be told
+    # apart from another one, even from itself, so the mismatch has to be confirmed.
+    assert check_environment(make_settings(ignore_mismatches=True), data) is True
+    mismatches = capsys.readouterr().out
+    assert "heretic-tpu" in mismatches
+    assert "critical chance" in mismatches
+
+    assert check_environment(make_settings(ignore_mismatches=False), data) is False
+
+    version = data["environment"]["heretic"]["version"]
+    for version_information in [
+        data["environment"]["heretic"],
+        asdict(get_heretic_version_info()),
+    ]:
+        assert format_version_information(version_information).startswith(
+            f"{version}-unknown-"
+        )
 
 
 def upstream_reproduce_json() -> dict[str, Any]:

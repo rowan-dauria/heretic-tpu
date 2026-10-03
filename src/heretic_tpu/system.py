@@ -50,7 +50,11 @@ def get_heretic_version_info() -> HereticVersionInfo:
     """Detects version and installation source (PyPI, Git, Local) of heretic-tpu."""
 
     package_name = "heretic-tpu"
-    origin_metadata: dict[str, Any] = {"type": "unknown"}
+    # Installations from other sources (archive URLs, other version control systems)
+    # get no "type", which format_version_information, here and in upstream Heretic,
+    # reads as an unknown origin. Upstream writes "type": "unknown" instead, which
+    # its reader rejects.
+    origin_metadata: dict[str, Any] = {}
     # This package must be installed for this code to run.
     distribution = importlib.metadata.distribution(package_name)
 
