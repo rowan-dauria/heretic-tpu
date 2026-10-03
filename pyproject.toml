@@ -7,7 +7,7 @@ license = "AGPL-3.0-or-later"
 authors = [
     { name = "Philipp Emanuel Weidmann", email = "pew@worldwidemann.com" },
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 keywords = ["llm", "transformer", "abliteration", "tpu", "jax"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -16,15 +16,21 @@ classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "datasets~=4.7",
     "huggingface-hub~=1.7",
-    "jax>=0.7",
-    "lm-eval~=0.4",
+    # immutabledict and langdetect are needed by IFEval, one of the default
+    # benchmarks, but lm-eval lists them only under its "ifeval" extra.
+    "immutabledict~=4.3",
+    # Releases before 0.11.2 compile abliteration with more than one module in
+    # flight, which breaks its memory bound. jax 0.11 needs Python 3.12.
+    "jax~=0.11.2",
+    "langdetect~=1.0",
+    # The JaxLM adapter imports helpers that lm_eval.models.utils has only since 0.4.13.
+    "lm-eval~=0.4.13",
     "ml-dtypes>=0.5",
     "numpy~=2.2",
     "optuna~=4.7",
@@ -42,7 +48,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tpu = [
-    "jax[tpu]>=0.7",
+    "jax[tpu]~=0.11.2",
 ]
 
 [dependency-groups]
@@ -83,6 +89,12 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[tool.ruff.lint]
+# Python 3.12 enables these, but generics and type aliases keep the TypeVar and
+# TypeAlias spelling of upstream Heretic (which supports Python 3.10), so that
+# ported code stays comparable with upstream's.
+ignore = ["UP040", "UP046", "UP047"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
