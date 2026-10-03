@@ -6,16 +6,28 @@
 import json
 import math
 import os
+import shutil
 import threading
 import time
 import tracemalloc
 from contextlib import ExitStack, suppress
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from huggingface_hub import constants as hf_constants
+from huggingface_hub.errors import (
+    GatedRepoError,
+    HfHubHTTPError,
+    LocalEntryNotFoundError,
+    OfflineModeIsEnabled,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 
 from heretic_tpu.backend import arch as arch_module
 from heretic_tpu.backend import weights
@@ -383,6 +395,9 @@ def test_stray_files_are_never_downloaded(tmp_path, monkeypatch) -> None:
 
     ckpt = weights.resolve_checkpoint("org/model", "main")
     assert ckpt.sha == FakeHub.SHA
+    assert not ckpt.offline
+    # snapshot_download resolves the branch, so that the cache records its commit.
+    assert hub.revisions == [("org/model", "main")]
     metadata = {name for _, name in hub.downloads}
     assert metadata == {
         "config.json",
@@ -394,6 +409,8 @@ def test_stray_files_are_never_downloaded(tmp_path, monkeypatch) -> None:
 
     check_config(ckpt.config)
     weights.fetch_shards(ckpt)
+    # The shards come from the resolved commit, whatever the branch points to now.
+    assert hub.revisions[1:] == [("org/model", FakeHub.SHA)]
     downloaded = {name for _, name in hub.downloads}
     assert downloaded - metadata == set(ckpt.shard_files)
     assert not set(stray) & downloaded
@@ -405,12 +422,186 @@ def test_stray_files_are_never_downloaded(tmp_path, monkeypatch) -> None:
     )
 
 
+# The commit of the cached repository in the offline tests.
+CACHED_SHA = "7a6a3128ee4137a248d6d1582824592b87a81647"
+
+
+def _fill_hub_cache(
+    repo: Path,
+    cache: Path,
+    names: tuple[str, ...] | None = None,
+) -> None:
+    """
+    Puts a checkpoint (only the files in `names`, if given) into a Hugging Face cache
+    as "org/model" at CACHED_SHA, as transformers and upstream fill the cache: blobs,
+    a snapshot of symbolic links to them and refs/main, but no cached file listing
+    (trees/), without which snapshot_download lists the files on the Hub.
+    """
+
+    root = cache / "models--org--model"
+    blobs = root / "blobs"
+    snapshot = root / "snapshots" / CACHED_SHA
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+
+    for index, path in enumerate(sorted(repo.iterdir())):
+        if names is None or path.name in names:
+            blob = blobs / f"blob{index}"
+            shutil.copyfile(path, blob)
+            (snapshot / path.name).symlink_to(os.path.relpath(blob, snapshot))
+
+    (root / "refs").mkdir()
+    (root / "refs" / "main").write_text(CACHED_SHA)
+
+
+@pytest.fixture
+def hub_cache(tmp_path, monkeypatch) -> Path:
+    """An empty Hugging Face cache, which huggingface_hub uses instead of the real one."""
+
+    cache = tmp_path / "hub"
+    cache.mkdir()
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(cache))
+    return cache
+
+
+def _load_resolved(ckpt: weights.Checkpoint):
+    check_config(ckpt.config)
+    weights.fetch_shards(ckpt)
+    tensors = weights.build_tensor_index(ckpt)
+    arch = ArchConfig.from_hf(ckpt.config, ckpt.raw_config, tensors)
+    plan = choose_plan(arch, np.float32, "single")
+    return arch, weights.load_params(ckpt, tensors, arch, np.float32, plan)
+
+
+@pytest.mark.parametrize("model_commit", [None, CACHED_SHA])
+@pytest.mark.parametrize("name", ["llama", "phi3-sharded"])
+def test_cached_model_loads_offline(
+    checkpoints,
+    hub_cache,
+    monkeypatch,
+    name: str,
+    model_commit: str | None,
+) -> None:
+    directory = checkpoints[name]
+    _fill_hub_cache(directory, hub_cache)
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+
+    with pytest.warns(UserWarning, match=f"local cache at commit {CACHED_SHA}"):
+        ckpt = weights.resolve_checkpoint("org/model", model_commit)
+    assert ckpt.offline
+    assert ckpt.sha == CACHED_SHA
+    local = weights.resolve_checkpoint(str(directory), None)
+    assert ckpt.shard_files == local.shard_files
+    assert ckpt.raw_config == local.raw_config
+
+    arch, params = _load_resolved(ckpt)
+    _, _, expected_arch, _, expected = _load(directory)
+    assert arch == expected_arch
+    flat = _flatten(params)
+    for path, value in _flatten(expected).items():
+        np.testing.assert_array_equal(np.asarray(flat[path]), np.asarray(value))
+
+
+def test_cached_model_loads_during_hub_outage(
+    checkpoints,
+    hub_cache,
+    monkeypatch,
+) -> None:
+    _fill_hub_cache(checkpoints["phi3-sharded"], hub_cache)
+    # Nothing listens on the discard port, so connections are refused.
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
+    monkeypatch.setattr(hf_constants, "ENDPOINT", "http://127.0.0.1:9")
+
+    with pytest.warns(UserWarning, match="ConnectError|refused"):
+        ckpt = weights.resolve_checkpoint("org/model", None)
+    assert ckpt.offline
+    assert ckpt.sha == CACHED_SHA
+    _load_resolved(ckpt)
+
+
+def _response(status_code: int) -> httpx.Response:
+    request = httpx.Request("GET", "https://huggingface.co/api/models/org/model")
+    return httpx.Response(status_code, request=request)
+
+
+@pytest.mark.parametrize(
+    ("error", "falls_back"),
+    [
+        (OfflineModeIsEnabled("offline"), True),
+        (httpx.ConnectError("refused"), True),
+        (httpx.ReadTimeout("timed out"), True),
+        (HfHubHTTPError("unavailable", response=_response(503)), True),
+        # The Hub rate-limits its API separately from file downloads.
+        (HfHubHTTPError("rate limited", response=_response(429)), True),
+        (HfHubHTTPError("request timeout", response=_response(408)), True),
+        (HfHubHTTPError("unauthorised", response=_response(401)), False),
+        (RepositoryNotFoundError("not found", response=_response(404)), False),
+        (GatedRepoError("gated", response=_response(403)), False),
+        (RevisionNotFoundError("no revision", response=_response(404)), False),
+    ],
+    ids=lambda value: type(value).__name__ if isinstance(value, Exception) else None,
+)
+def test_only_an_unreachable_hub_falls_back_to_the_cache(
+    checkpoints,
+    hub_cache,
+    monkeypatch,
+    error: Exception,
+    falls_back: bool,
+) -> None:
+    _fill_hub_cache(checkpoints["llama"], hub_cache)
+    # snapshot_download finds the cached commit by itself, and model_info fails.
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+
+    def model_info(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        weights, "HfApi", lambda: SimpleNamespace(model_info=model_info)
+    )
+
+    if falls_back:
+        with pytest.warns(UserWarning, match="local cache"):
+            assert weights.resolve_checkpoint("org/model", None).offline
+    else:
+        with pytest.raises(type(error)):
+            weights.resolve_checkpoint("org/model", None)
+
+
+def test_offline_errors_name_what_is_not_cached(
+    checkpoints,
+    hub_cache,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+
+    # Nothing is cached.
+    for model_commit in (None, CACHED_SHA):
+        with pytest.raises(LocalEntryNotFoundError) as raised:
+            weights.resolve_checkpoint("org/model", model_commit)
+        assert isinstance(raised.value.__cause__, OfflineModeIsEnabled)
+
+    # Only the metadata is cached, as after an interrupted download.
+    directory = checkpoints["phi3-sharded"]
+    _fill_hub_cache(directory, hub_cache, weights.METADATA_FILES)
+    with pytest.warns(UserWarning, match="local cache"):
+        ckpt = weights.resolve_checkpoint("org/model", None)
+    with pytest.raises(LocalEntryNotFoundError, match=ckpt.shard_files[0]):
+        weights.fetch_shards(ckpt)
+
+    # A single-file checkpoint with only its configuration cached.
+    shutil.rmtree(hub_cache / "models--org--model")
+    _fill_hub_cache(checkpoints["llama"], hub_cache, (weights.CONFIG_FILE,))
+    with pytest.raises(LocalEntryNotFoundError, match="lacks"):
+        weights.resolve_checkpoint("org/model", None)
+
+
 def test_resolve_checkpoint_local(checkpoints, tmp_path) -> None:
     directory = checkpoints["llama"]
     ckpt = weights.resolve_checkpoint(str(directory), None)
     assert ckpt.model == str(directory)
     assert ckpt.snapshot_dir == str(directory)
     assert ckpt.sha is None
+    assert not ckpt.offline
     assert ckpt.index is None
     assert ckpt.shard_files == ("model.safetensors",)
     assert ckpt.raw_config == json.loads((directory / "config.json").read_text())

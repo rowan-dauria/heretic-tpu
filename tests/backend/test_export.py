@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from huggingface_hub import constants as hf_constants
 from safetensors import safe_open
 
 from heretic_tpu.backend import arch as arch_module
@@ -789,6 +790,42 @@ def test_stray_files_are_never_downloaded_or_exported(tmp_path, monkeypatch) -> 
         config = json.loads((tmp_path / "adapter" / "adapter_config.json").read_text())
         assert config["base_model_name_or_path"] == "org/model"
         assert config["revision"] == revision
+
+
+def test_merged_export_of_a_checkpoint_resolved_offline(
+    checkpoints,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    # A cache as transformers fills it, without the file listing of the commit,
+    # for which snapshot_download asks the Hub even when given a commit hash.
+    source = checkpoints["phi3-sharded"]
+    cache = tmp_path / "hub"
+    snapshot = _cache_snapshot(source, cache / "models--org--model")
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(cache))
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+
+    with pytest.warns(UserWarning, match="local cache"):
+        ckpt = weights.resolve_checkpoint("org/model", FakeHub.SHA)
+    assert ckpt.offline
+    check_config(ckpt.config)
+    weights.fetch_shards(ckpt)
+    tensors = weights.build_tensor_index(ckpt)
+    arch = ArchConfig.from_hf(ckpt.config, ckpt.raw_config, tensors)
+
+    target = tmp_path / "merged"
+    export.save_merged(
+        str(target),
+        ckpt,
+        tensors,
+        arch,
+        _random_adapters(arch),
+        _facade_tokenizer(str(snapshot)),
+    )
+
+    # Everything, the tokenizer files included, is taken from the cache.
+    assert _files(target) == _files(source)
+    _assert_loads_cleanly(target)
 
 
 def test_tokenizer_and_processor_files(checkpoints, tmp_path) -> None:

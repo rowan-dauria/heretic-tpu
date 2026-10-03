@@ -57,15 +57,22 @@ import json
 import math
 import os
 import threading
+import warnings
 from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
+import httpx
 import jax
 import ml_dtypes  # noqa: F401 (registers bfloat16 with NumPy, which reading relies on)
 import numpy as np
 from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub.errors import (
+    HfHubHTTPError,
+    LocalEntryNotFoundError,
+    OfflineModeIsEnabled,
+)
 from safetensors import safe_open
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
@@ -93,6 +100,9 @@ CONFIG_FILE = "config.json"
 GENERATION_CONFIG_FILE = "generation_config.json"
 INDEX_FILE = "model.safetensors.index.json"
 SINGLE_FILE = "model.safetensors"
+
+# The files resolve_checkpoint downloads.
+METADATA_FILES = (CONFIG_FILE, GENERATION_CONFIG_FILE, INDEX_FILE)
 
 # Candidate text-model prefixes. Multimodal wrappers saved by transformers
 # (including transformers 5) use "language_model.model.", which transformers
@@ -207,6 +217,11 @@ class Checkpoint:
     # The resolved commit (None for a local directory).
     sha: str | None
 
+    # Whether the Hub could not be reached, so that the commit was resolved, and the
+    # files are taken, from the local Hugging Face cache only (False for a local
+    # directory).
+    offline: bool
+
     # Parsed config.json.
     raw_config: dict[str, Any]
 
@@ -280,24 +295,40 @@ def resolve_checkpoint(model: str, model_commit: str | None) -> Checkpoint:
     """
     Resolves a Hub id or a local directory and downloads the metadata files
     (configuration, generation configuration and safetensors index) only.
+
+    When the Hub cannot be reached, a Hub id is resolved from the local Hugging Face
+    cache instead, as transformers does, with a warning (see `Checkpoint.offline`).
     """
 
     if os.path.isdir(model):
         snapshot_dir = model
         sha = None
-        has_single_file = os.path.isfile(os.path.join(model, SINGLE_FILE))
+        offline = False
+        # The files of the commit on the Hub (None: those in snapshot_dir).
+        repo_files: set[str] | None = None
     else:
-        # Resolve the commit once, so that all files come from the same commit.
-        info = HfApi().model_info(model, revision=model_commit)
-        sha = info.sha
-        snapshot_dir = snapshot_download(
-            model,
-            revision=sha,
-            allow_patterns=[CONFIG_FILE, GENERATION_CONFIG_FILE, INDEX_FILE],
-        )
-        has_single_file = SINGLE_FILE in {
-            sibling.rfilename for sibling in info.siblings or []
-        }
+        try:
+            # Resolve the commit once, so that all files come from the same commit.
+            # snapshot_download records the commit of a branch or tag in the cache,
+            # where a later offline run finds it.
+            snapshot_dir = snapshot_download(
+                model,
+                revision=model_commit,
+                allow_patterns=list(METADATA_FILES),
+            )
+            info = HfApi().model_info(model, revision=os.path.basename(snapshot_dir))
+            offline = False
+            repo_files = {sibling.rfilename for sibling in info.siblings or []}
+        except Exception as error:
+            if not _is_hub_unreachable(error):
+                raise
+            snapshot_dir = _cached_snapshot(model, model_commit, error)
+            offline = True
+            # Only the cached files can be loaded.
+            repo_files = None
+
+        # Snapshot directories are named after their commit.
+        sha = os.path.basename(snapshot_dir)
 
     try:
         config = AutoConfig.from_pretrained(snapshot_dir, trust_remote_code=False)
@@ -309,6 +340,13 @@ def resolve_checkpoint(model: str, model_commit: str | None) -> Checkpoint:
 
     with open(os.path.join(snapshot_dir, CONFIG_FILE), encoding="utf-8") as file:
         raw_config = json.load(file)
+
+    # model.safetensors is fetched later with the shard set, so on the Hub it is looked
+    # up in the file list of the commit.
+    if repo_files is None:
+        has_single_file = os.path.isfile(os.path.join(snapshot_dir, SINGLE_FILE))
+    else:
+        has_single_file = SINGLE_FILE in repo_files
 
     index_path = os.path.join(snapshot_dir, INDEX_FILE)
     if os.path.isfile(index_path):
@@ -334,6 +372,7 @@ def resolve_checkpoint(model: str, model_commit: str | None) -> Checkpoint:
         model=model,
         snapshot_dir=snapshot_dir,
         sha=sha,
+        offline=offline,
         raw_config=raw_config,
         config=config,
         index=index,
@@ -342,10 +381,94 @@ def resolve_checkpoint(model: str, model_commit: str | None) -> Checkpoint:
     )
 
 
+def _is_hub_unreachable(error: Exception) -> bool:
+    """
+    Whether an error means that the Hub cannot be reached: offline mode, a failed
+    connection or a timeout (on which huggingface_hub's snapshot_download also falls
+    back to the cache), a server error, or rate limiting (429) or a request timeout
+    (408), which huggingface_hub also treats as transient and which the Hub's API
+    returns on its own while file downloads still succeed. Errors about the repository
+    or the revision (RepositoryNotFoundError, GatedRepoError, RevisionNotFoundError
+    and other client errors) are not, as the cache must not hide them.
+    """
+
+    if isinstance(error, HfHubHTTPError):
+        response = error.response
+        return response is not None and (
+            response.status_code >= 500 or response.status_code in (408, 429)
+        )
+
+    return isinstance(
+        error,
+        (OfflineModeIsEnabled, httpx.ConnectError, httpx.TimeoutException),
+    )
+
+
+def _cached_snapshot(model: str, model_commit: str | None, error: Exception) -> str:
+    """
+    The cached snapshot directory of the commit the cache records for `model_commit`
+    (the default branch if None), for when the Hub cannot be reached (`error`).
+    """
+
+    try:
+        snapshot_dir = snapshot_download(
+            model,
+            revision=model_commit,
+            allow_patterns=list(METADATA_FILES),
+            local_files_only=True,
+        )
+    except LocalEntryNotFoundError as cache_error:
+        raise cache_error from error
+
+    sha = os.path.basename(snapshot_dir)
+
+    # Without a cached file listing of the commit (which transformers does not
+    # write), snapshot_download returns the snapshot directory even if files are
+    # missing from it.
+    if not os.path.isfile(os.path.join(snapshot_dir, CONFIG_FILE)) or not any(
+        os.path.isfile(os.path.join(snapshot_dir, name))
+        for name in (INDEX_FILE, SINGLE_FILE)
+    ):
+        raise LocalEntryNotFoundError(
+            f"The Hugging Face Hub cannot be reached, and the cached snapshot of "
+            f"{model} at commit {sha} lacks {CONFIG_FILE}, or both "
+            f"{SINGLE_FILE} and {INDEX_FILE}."
+        ) from error
+
+    # Like load_prompts, which tolerates an unreachable Hub for cached datasets.
+    warnings.warn(
+        f"The Hugging Face Hub cannot be reached ({error}). "
+        f"{model} is loaded from the local cache at commit {sha}, "
+        "which could not be checked against the Hub.",
+        stacklevel=3,
+    )
+
+    return snapshot_dir
+
+
 def fetch_shards(ckpt: Checkpoint) -> None:
-    """Downloads exactly the shard set (no-op for a local directory)."""
+    """
+    Downloads exactly the shard set (no-op for a local directory). When the Hub could
+    not be reached (`ckpt.offline`), checks that the shard set is cached instead.
+    """
 
     if ckpt.sha is None:
+        return
+
+    if ckpt.offline:
+        # snapshot_download would list the files of the commit on the Hub, unless
+        # the listing is cached (which transformers does not do).
+        missing = [
+            shard
+            for shard in ckpt.shard_files
+            if not os.path.isfile(os.path.join(ckpt.snapshot_dir, shard))
+        ]
+        if missing:
+            raise LocalEntryNotFoundError(
+                f"The Hugging Face Hub cannot be reached, and {len(missing)} of the "
+                f"{len(ckpt.shard_files)} safetensors files of {ckpt.model} at commit "
+                f"{ckpt.sha} are not cached: {', '.join(missing)}."
+            )
         return
 
     snapshot_download(

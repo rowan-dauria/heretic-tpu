@@ -356,6 +356,9 @@ def _tokenizer_files_dir(ckpt: Checkpoint) -> str:
         ckpt.model,
         revision=ckpt.sha,
         allow_patterns=list(TOKENIZER_FILES),
+        # The Hub could not be reached when the checkpoint was resolved, so the
+        # files are taken from the cache, where the tokenizer was loaded from.
+        local_files_only=ckpt.offline,
     )
 
 
