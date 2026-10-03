@@ -363,9 +363,12 @@ class Model:
         self.params = None
         self.adapters = None
 
-        if not keep_engine and self.engine is not None:
-            self.engine.release()
-            self.engine = None
+        if self.engine is not None:
+            # A kept engine reserves room for adapters again until they are applied.
+            self.engine.adapters_allocated = False
+            if not keep_engine:
+                self.engine.release()
+                self.engine = None
 
         # Tied leaves appear twice. Deleting the arrays makes stale references
         # elsewhere fail loudly instead of keeping the memory in use.
@@ -414,6 +417,8 @@ class Model:
 
         self.adapters = self._initial_adapters(lora_rank)
         self.lora_rank = lora_rank
+        # The engine no longer needs to reserve room for them (see Engine.fits).
+        self.engine.adapters_allocated = True
 
     def _initial_adapters(self, lora_rank: int) -> Lora:
         root = self._root_key()

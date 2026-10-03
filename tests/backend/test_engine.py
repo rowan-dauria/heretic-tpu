@@ -728,6 +728,15 @@ def test_fits_reserves_memory(monkeypatch) -> None:
     monkeypatch.setattr(engine, "_memory_stats", stats(in_use + 2))
     assert not eng.fits(no_lora, 8)
 
+    # Calls without adapters while adapters are allocated (lora_disabled()) find them
+    # in `bytes_in_use` already, so they are not reserved a second time.
+    eng.adapters_allocated = True
+    in_use = int(limit - reserve - eng.memory_need(no_lora, 8))
+    monkeypatch.setattr(engine, "_memory_stats", stats(in_use))
+    assert eng.fits(no_lora, 8)
+    monkeypatch.setattr(engine, "_memory_stats", stats(in_use + 2))
+    assert not eng.fits(no_lora, 8)
+
     # Outputs kept on the device need another 10 %.
     on_device = Engine(
         arch,

@@ -1000,6 +1000,11 @@ class Engine:
         self._fitting: dict[ShapeKey, int] = {}
         self._failing: dict[ShapeKey, int] = {}
 
+        # Whether the owner of the parameters holds adapters on the device, set by
+        # the owner (the facade allocates them itself). Resident adapters are part
+        # of `bytes_in_use`, also during calls that run without them (see `fits`).
+        self.adapters_allocated = False
+
     # Entry points.
 
     def capture(
@@ -1173,7 +1178,16 @@ class Engine:
             return True
 
         need = self.memory_need(key, batch_size)
-        adapter_bytes = self._default_adapter_bytes() if key.rank is None else 0
+
+        # Until adapters exist, room for the largest default ones stays free, so that
+        # batch sizes found before apply_lora still fit afterwards. Once they exist,
+        # they are in `bytes_in_use` already, also for calls that run without them
+        # (inside the facade's lora_disabled()), and reserving them again would
+        # shrink those calls' batches.
+        if key.rank is None and not self.adapters_allocated:
+            adapter_bytes = self._default_adapter_bytes()
+        else:
+            adapter_bytes = 0
         for device_stats in stats:
             bytes_limit = device_stats["bytes_limit"]
             free = bytes_limit - device_stats["bytes_in_use"]

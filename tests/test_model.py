@@ -1277,6 +1277,46 @@ def test_out_of_memory_halves_the_batch(checkpoints, monkeypatch) -> None:
         assert [size for _, size in lowered] == [BATCH_SIZE]
 
 
+def test_adapters_are_reserved_only_until_they_exist(checkpoints, monkeypatch) -> None:
+    """
+    Calls without adapters keep room for rank-50 adapters free only while there are
+    none: inside lora_disabled(), the allocated adapters are in use already.
+    """
+
+    model = Model(make_settings(checkpoints["qwen2"]))
+    short = PROMPTS[::2]
+    key = engine_module.ShapeKey("capture", 32, None, want=frozenset({"logits"}))
+
+    # Device memory that holds the call (auto mode: B = 4) and the 5 % reserve, but
+    # not room for adapters as well.
+    limit = 2**30
+    need = model.engine.memory_need(key, len(short))
+    in_use = int(limit - engine_module.MEMORY_RESERVE * limit - need)
+    monkeypatch.setattr(
+        engine_module,
+        "_memory_stats",
+        lambda devices: [{"bytes_limit": limit, "bytes_in_use": in_use}],
+    )
+
+    checks = []
+    with recording(model.engine, "fits", checks):
+        with pytest.raises(DeviceMemoryError):
+            model.get_logits(short)
+
+        model.apply_lora(2)
+        with model.lora_disabled():
+            model.get_logits(short)
+    assert checks == [(key, len(short))] * 2
+
+    # A fast reset keeps the adapters allocated; after the slow path, the kept engine
+    # keeps room for them free again until they are applied anew.
+    assert model.reset_model()
+    assert model.engine.fits(key, len(short))
+    model.settings.model = str(checkpoints["qwen2-copy"])
+    assert not model.reset_model()
+    assert not model.engine.fits(key, len(short))
+
+
 # Benchmarks and export.
 
 
