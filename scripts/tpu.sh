@@ -6,7 +6,8 @@
 # Usage:
 #   scripts/tpu.sh setup        Install uv and the shared virtual environment on the VM.
 #   scripts/tpu.sh sync         Copy the working tree (tracked and untracked, non-ignored files,
-#                               plus the git-ignored .scratch/ directory).
+#                               the files of the heretic/ submodule, and the git-ignored
+#                               .scratch/ directory).
 #   scripts/tpu.sh run CMD...   Sync, then run CMD inside the synced tree on the VM.
 #   scripts/tpu.sh exec CMD...  Like run, but without syncing first.
 #   scripts/tpu.sh submit NAME CMD...
@@ -26,10 +27,16 @@
 #                                     process can use the TPU at a time, so set this
 #                                     only for commands that don't touch it (e.g. when
 #                                     running with JAX_PLATFORMS=cpu).
+#   TPU_LOCK_WAIT                     Seconds that run and exec wait for the TPU lock
+#                                     before giving up with exit status 75 (default:
+#                                     300). Detached submit jobs always wait.
 #
 # All remote commands run with the shared virtual environment activated and with
 # PYTHONPATH pointing at the synced src/ directory, so several checkouts can share
-# one environment.
+# one environment. They also run with HERETIC_TPU_REQUIRE_UPSTREAM=1, which makes
+# the tests that compare with upstream Heretic fail rather than skip when the
+# heretic/ submodule is missing (see tests/conftest.py), because the VM is where
+# the tests run.
 
 set -euo pipefail
 
@@ -39,6 +46,7 @@ set -euo pipefail
 
 REMOTE_DIR="${TPU_REMOTE_DIR:-heretic-tpu}"
 LOCK="${TPU_LOCK:-1}"
+LOCK_WAIT="${TPU_LOCK_WAIT:-300}"
 VENV='$HOME/.venvs/heretic-tpu'
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -58,20 +66,30 @@ cd "\$HOME/$REMOTE_DIR"
 if [ -f "$VENV/bin/activate" ]; then source "$VENV/bin/activate"; fi
 export PYTHONPATH="\$HOME/$REMOTE_DIR/src\${PYTHONPATH:+:\$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
+export HERETIC_TPU_REQUIRE_UPSTREAM=1
 EOF
 }
 
 do_sync() {
     # Remove previously synced code first so that deleted files don't linger.
-    # The git-ignored .scratch/ directory is synced as well, for throwaway scripts
-    # that should run on the VM rather than locally.
+    # The files of the heretic/ submodule (upstream Heretic, which the parity tests
+    # compare with) are synced in place of its gitlink. The git-ignored .scratch/
+    # directory is synced as well, for throwaway scripts that should run on the VM
+    # rather than locally.
+    # Paths that don't exist are dropped, because tar fails on them: git still lists
+    # a tracked file that was deleted until the deletion is staged. `if` rather than
+    # `&&` keeps a missing last path from failing the loop, and -L keeps dangling
+    # tracked symbolic links. This runs on macOS too, so no GNU-only options are used.
     (
         cd "$REPO_ROOT"
         {
             git ls-files -z --cached --others --exclude-standard | grep -zv '^heretic$'
+            git ls-files -z --recurse-submodules --cached -- heretic
             if [ -d .scratch ]; then find .scratch -type f -print0; fi
-        } | COPYFILE_DISABLE=1 tar --null -T - -czf -
-    ) | ssh_tpu --command="mkdir -p \"\$HOME/$REMOTE_DIR\" && cd \"\$HOME/$REMOTE_DIR\" && rm -rf src tests scripts .scratch && tar -xzf - 2>/dev/null"
+        } | while IFS= read -r -d '' path; do
+            if [ -e "$path" ] || [ -L "$path" ]; then printf '%s\0' "$path"; fi
+        done | COPYFILE_DISABLE=1 tar --null -T - -czf -
+    ) | ssh_tpu --command="mkdir -p \"\$HOME/$REMOTE_DIR\" && cd \"\$HOME/$REMOTE_DIR\" && rm -rf src tests scripts .scratch heretic && tar -xzf - 2>/dev/null"
 }
 
 do_exec() {
@@ -79,7 +97,15 @@ do_exec() {
     local quoted
     quoted="$(printf '%q' "$command")"
     if [ "$LOCK" = "1" ]; then
-        command="flock /tmp/heretic-tpu.lock bash -c $quoted"
+        # Give up rather than block indefinitely behind another job, so that callers
+        # with a time limit (such as automated agents) get an answer.
+        command="flock -w $LOCK_WAIT -E 75 /tmp/heretic-tpu.lock bash -c $quoted || {
+    status=\$?
+    if [ \$status -eq 75 ]; then
+        echo 'The TPU is busy: another job held the lock for $LOCK_WAIT s. Try again later, or use submit.' >&2
+    fi
+    exit \$status
+}"
     else
         command="bash -c $quoted"
     fi
