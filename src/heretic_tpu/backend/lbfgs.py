@@ -35,21 +35,58 @@ class LBFGSState(NamedTuple):
 
     The history (PyTorch's lists `old_dirs`, `old_stps` and `ro`) is a ring buffer
     of `history_size` rows: its `num_old` entries, oldest first, are stored in rows
-    `head, head + 1, …` modulo `history_size`.
+    `head, head + 1, …` modulo `history_size`. Each row of `old_dirs` and `old_stps`
+    holds a vector of `n` parameters as a block of shape `history_row_shape(n)`
+    (see there).
     """
 
     func_evals: Array  # int32 [], total number of function evaluations
     n_iter: Array  # int32 [], total number of iterations
     d: Array  # float32 [n], the last search direction
     t: Array  # float32 [], the last step length
-    old_dirs: Array  # float32 [history_size, n], gradient differences y
-    old_stps: Array  # float32 [history_size, n], steps s
+    # float32 [history_size, *history_row_shape(n)]: gradient differences y and steps s
+    old_dirs: Array
+    old_stps: Array
     ro: Array  # float32 [history_size], 1 / (y·s)
     num_old: Array  # int32 [], number of history entries
     head: Array  # int32 [], row of the oldest history entry
     H_diag: Array  # float32 [], scale of the initial inverse Hessian approximation
     prev_flat_grad: Array  # float32 [n]
     prev_loss: Array  # float32 []
+
+
+# TPUs lay out the two minor dimensions of an array in tiles of 8 × 128 elements
+# (sublanes × lanes). In a [history_size, n] array a row would be spread over one
+# sublane of each of n / 128 tiles, so every read or write of a row in the two-loop
+# recursion would move eight times its bytes. For ARA on a 4B model that made the
+# optimiser's own vector work about 2.5 times slower.
+LANES = 128
+TILE = 8 * LANES
+
+
+def history_row_shape(n_params: int) -> tuple[int, int]:
+    """
+    The shape in which a history row stores a vector of `n_params` elements: zero-padded
+    to whole 8 × 128 tiles and folded into rows of 128 lanes, so that each row
+    occupies its own tiles. Values are unchanged: rows are reshaped to `[n_params]`
+    wherever they are read or written, and the padding is never read.
+    """
+
+    padded = -(-n_params // TILE) * TILE
+    return padded // LANES, LANES
+
+
+def _read_row(history: Array, row: Array, n_params: int) -> Array:
+    flat = history[row].reshape(-1)
+    return flat if flat.shape[0] == n_params else flat[:n_params]
+
+
+def _write_row(history: Array, row: Array, value: Array) -> Array:
+    shape = history.shape[1:]
+    padding = shape[0] * shape[1] - value.shape[0]
+    if padding:
+        value = jnp.pad(value, (0, padding))
+    return history.at[row].set(value.reshape(shape))
 
 
 def init(n_params: int, history_size: int) -> LBFGSState:
@@ -61,8 +98,8 @@ def init(n_params: int, history_size: int) -> LBFGSState:
         n_iter=jnp.zeros((), jnp.int32),
         d=jnp.zeros((n_params,), jnp.float32),
         t=jnp.zeros((), jnp.float32),
-        old_dirs=jnp.zeros((history_size, n_params), jnp.float32),
-        old_stps=jnp.zeros((history_size, n_params), jnp.float32),
+        old_dirs=jnp.zeros((history_size, *history_row_shape(n_params)), jnp.float32),
+        old_stps=jnp.zeros((history_size, *history_row_shape(n_params)), jnp.float32),
         ro=jnp.zeros((history_size,), jnp.float32),
         num_old=jnp.zeros((), jnp.int32),
         head=jnp.zeros((), jnp.int32),
@@ -373,15 +410,22 @@ def _two_loop_recursion(flat_grad: Array, state: LBFGSState) -> Array:
     # The approximate inverse Hessian (L-BFGS) multiplied by the negative
     # gradient, with PyTorch's loop order and in-place update formulas.
     history_size = state.ro.shape[0]
+    n_params = flat_grad.shape[0]
 
     def row(i: Array) -> Array:
         return (state.head + i) % history_size
 
+    def old_dir(i: Array) -> Array:
+        return _read_row(state.old_dirs, row(i), n_params)
+
+    def old_stp(i: Array) -> Array:
+        return _read_row(state.old_stps, row(i), n_params)
+
     def newest_to_oldest(j: Array, carry: tuple[Array, Array]) -> tuple[Array, Array]:
         q, al = carry
         i = state.num_old - 1 - j
-        al_i = _dot(state.old_stps[row(i)], q) * state.ro[row(i)]
-        return q - al_i * state.old_dirs[row(i)], al.at[i].set(al_i)
+        al_i = _dot(old_stp(i), q) * state.ro[row(i)]
+        return q - al_i * old_dir(i), al.at[i].set(al_i)
 
     q, al = lax.fori_loop(
         0,
@@ -392,8 +436,8 @@ def _two_loop_recursion(flat_grad: Array, state: LBFGSState) -> Array:
 
     # Multiply by the initial Hessian.
     def oldest_to_newest(i: Array, r: Array) -> Array:
-        be_i = _dot(state.old_dirs[row(i)], r) * state.ro[row(i)]
-        return r + (al[i] - be_i) * state.old_stps[row(i)]
+        be_i = _dot(old_dir(i), r) * state.ro[row(i)]
+        return r + (al[i] - be_i) * old_stp(i)
 
     return lax.fori_loop(0, state.num_old, oldest_to_newest, q * state.H_diag)
 
@@ -411,8 +455,8 @@ def _update_memory(flat_grad: Array, state: LBFGSState) -> LBFGSState:
             full, state.head, (state.head + state.num_old) % history_size
         )
         return state._replace(
-            old_dirs=state.old_dirs.at[position].set(y),
-            old_stps=state.old_stps.at[position].set(s),
+            old_dirs=_write_row(state.old_dirs, position, y),
+            old_stps=_write_row(state.old_stps, position, s),
             ro=state.ro.at[position].set(1.0 / ys),
             num_old=jnp.where(full, state.num_old, state.num_old + 1),
             head=jnp.where(full, (state.head + 1) % history_size, state.head),
@@ -460,6 +504,13 @@ def step(
         raise ValueError(
             f"The state holds a history of size {state.ro.shape[0]}, "
             f"but history_size is {history_size}."
+        )
+    if state.d.shape != x.shape or state.old_dirs.shape[1:] != history_row_shape(
+        x.shape[0]
+    ):
+        raise ValueError(
+            f"The state was initialised for {state.d.shape[0]} parameters "
+            f"(history rows {state.old_dirs.shape[1:]}), but x has {x.shape[0]}."
         )
 
     max_eval = max_iter * 5 // 4

@@ -254,6 +254,12 @@ def run_port(
             history_size=history_size,
         )
 
+    def history(rows: Any, row: int) -> np.ndarray:
+        # A history row as the flat vector it stores. Its padding stays zero.
+        flat = np.asarray(rows[row]).ravel()
+        assert not flat[x.size :].any()
+        return flat[: x.size]
+
     results = []
     for _ in range(steps):
         x, state, loss = optimise(x, state, data)
@@ -267,8 +273,8 @@ def run_port(
                 "n_iter": int(state.n_iter),
                 "d": np.asarray(state.d),
                 "t": float(state.t),
-                "old_dirs": [np.asarray(state.old_dirs[row]) for row in rows],
-                "old_stps": [np.asarray(state.old_stps[row]) for row in rows],
+                "old_dirs": [history(state.old_dirs, row) for row in rows],
+                "old_stps": [history(state.old_stps, row) for row in rows],
                 "ro": [float(state.ro[row]) for row in rows],
                 "H_diag": float(state.H_diag),
                 "prev_flat_grad": np.asarray(state.prev_flat_grad),
@@ -494,7 +500,7 @@ def test_step_traces_without_host_synchronisation() -> None:
 
 
 @pytest.mark.usefixtures("cpu")
-def test_mismatched_history_size_raises() -> None:
+def test_mismatched_state_raises() -> None:
     with pytest.raises(ValueError, match="history_size"):
         lbfgs.step(
             rosenbrock_jax,
@@ -505,3 +511,86 @@ def test_mismatched_history_size_raises() -> None:
             max_iter=5,
             history_size=5,
         )
+    with pytest.raises(ValueError, match="initialised for 3 parameters"):
+        lbfgs.step(
+            rosenbrock_jax,
+            jnp.zeros(4),
+            lbfgs.init(3, 4),
+            None,
+            lr=1.0,
+            max_iter=5,
+            history_size=4,
+        )
+
+
+@pytest.mark.parametrize(
+    "n_params, row_shape",
+    [
+        # ARA's down_proj and o_proj of Qwen3-4B at rank 50: whole tiles.
+        (50 * (9728 + 2560), (4800, 128)),
+        (50 * (4096 + 2560), (2600, 128)),
+        (1024, (8, 128)),
+        # Padded to whole 8 × 128 tiles.
+        (1, (8, 128)),
+        (1025, (16, 128)),
+    ],
+)
+def test_history_rows_occupy_whole_tiles(
+    n_params: int,
+    row_shape: tuple[int, int],
+) -> None:
+    # Each history row is a block of whole (8, 128) TPU tiles, so that reading or
+    # writing one row moves only that row's bytes (see lbfgs.history_row_shape).
+    state = lbfgs.init(n_params, 10)
+    assert state.old_dirs.shape == state.old_stps.shape == (10, *row_shape)
+    assert lbfgs.history_row_shape(n_params) == row_shape
+    assert state.d.shape == state.prev_flat_grad.shape == (n_params,)
+
+
+@pytest.mark.parametrize("n_params", [1000, 2048])
+def test_history_layout_does_not_change_results(
+    device: jax.Device,
+    monkeypatch: pytest.MonkeyPatch,
+    n_params: int,
+) -> None:
+    # History rows are stored in whole tiles but read and written as flat vectors,
+    # so the optimiser takes exactly the steps it takes with flat rows, padded
+    # (1000 parameters) or not.
+    rng = np.random.default_rng(0)
+    data = (
+        jnp.asarray(10 ** rng.uniform(0, 3, n_params), jnp.float32),
+        jnp.asarray(rng.standard_normal(n_params), jnp.float32),
+    )
+
+    def quadratic(x: jax.Array, data: tuple[jax.Array, jax.Array]) -> jax.Array:
+        curvature, target = data
+        return 0.5 * jnp.sum(curvature * (x - target) ** 2)
+
+    def run() -> tuple[np.ndarray, lbfgs.LBFGSState]:
+        # A new function for each run, so that each traces the current layout.
+        step = jax.jit(
+            functools.partial(
+                lbfgs.step, quadratic, lr=1.0, max_iter=20, history_size=4
+            )
+        )
+        x = jnp.zeros(n_params, jnp.float32)
+        state = lbfgs.init(n_params, 4)
+        for _ in range(3):
+            x, state, _ = step(x, state, data)
+        return np.asarray(x), state
+
+    x, state = run()
+    with monkeypatch.context() as patch:
+        patch.setattr(lbfgs, "history_row_shape", lambda n_params: (1, n_params))
+        x_flat, state_flat = run()
+
+    assert state.old_dirs.shape[1:] != state_flat.old_dirs.shape[1:]
+    assert int(state.num_old) == 4
+    assert np.array_equal(x, x_flat)
+    for history, history_flat in [
+        (state.old_dirs, state_flat.old_dirs),
+        (state.old_stps, state_flat.old_stps),
+    ]:
+        rows = np.asarray(history).reshape(4, -1)
+        assert np.array_equal(rows[:, :n_params], np.asarray(history_flat)[:, 0])
+        assert not rows[:, n_params:].any()
