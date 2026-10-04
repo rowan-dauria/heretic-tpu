@@ -59,7 +59,7 @@ PyTorch is not needed at run time.
 ## Usage
 
 ```sh
-git clone <this repository> heretic-tpu
+git clone https://github.com/rowan-dauria/heretic-tpu.git
 cd heretic-tpu
 uv sync --extra tpu
 uv run heretic-tpu Qwen/Qwen3-4B-Instruct-2507
