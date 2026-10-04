@@ -58,7 +58,7 @@ import math
 import os
 import threading
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
@@ -228,7 +228,7 @@ class Checkpoint:
     # As resolved by AutoConfig.
     config: PretrainedConfig
 
-    # Parsed model.safetensors.index.json, if present.
+    # Parsed model.safetensors.index.json, if present and not stale (see _shard_set).
     index: dict[str, Any] | None
 
     # The shard set: the files the index maps tensors to, or model.safetensors.
@@ -341,32 +341,26 @@ def resolve_checkpoint(model: str, model_commit: str | None) -> Checkpoint:
     with open(os.path.join(snapshot_dir, CONFIG_FILE), encoding="utf-8") as file:
         raw_config = json.load(file)
 
-    # model.safetensors is fetched later with the shard set, so on the Hub it is looked
+    # Weight files are fetched later with the shard set, so on the Hub they are looked
     # up in the file list of the commit.
-    if repo_files is None:
-        has_single_file = os.path.isfile(os.path.join(snapshot_dir, SINGLE_FILE))
-    else:
-        has_single_file = SINGLE_FILE in repo_files
+    def has_file(name: str) -> bool:
+        if repo_files is None:
+            return os.path.isfile(os.path.join(snapshot_dir, name))
+        return name in repo_files
 
-    index_path = os.path.join(snapshot_dir, INDEX_FILE)
-    if os.path.isfile(index_path):
-        with open(index_path, encoding="utf-8") as file:
-            index = json.load(file)
-        shard_files = tuple(sorted(set(index["weight_map"].values())))
-    elif has_single_file:
-        index = None
-        shard_files = (SINGLE_FILE,)
-    else:
-        raise UnsupportedCheckpointError(
-            f"{model} has neither {SINGLE_FILE} nor {INDEX_FILE}. "
-            "Only safetensors checkpoints are supported."
-        )
+    index, shard_files = _shard_set(model, snapshot_dir, offline, has_file)
 
-    # As transformers resolves it for generate().
+    # As transformers resolves it for generate(): without generation_config.json, from
+    # the raw config.json, which keeps the token ids and the legacy generation
+    # parameters that the resolved config fills with class defaults or drops.
     if os.path.isfile(os.path.join(snapshot_dir, GENERATION_CONFIG_FILE)):
         generation_config = GenerationConfig.from_pretrained(snapshot_dir)
     else:
-        generation_config = GenerationConfig.from_model_config(config)
+        generation_config = GenerationConfig.from_pretrained(
+            snapshot_dir,
+            config_file_name=CONFIG_FILE,
+            _from_model_config=True,
+        )
 
     return Checkpoint(
         model=model,
@@ -378,6 +372,67 @@ def resolve_checkpoint(model: str, model_commit: str | None) -> Checkpoint:
         index=index,
         shard_files=shard_files,
         generation_config=generation_config,
+    )
+
+
+def _shard_set(
+    model: str,
+    snapshot_dir: str,
+    offline: bool,
+    has_file: Callable[[str], bool],
+) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+    """
+    The parsed safetensors index (None without one) and the shard set. `has_file`
+    tells whether the checkpoint has a weight file (when `offline`, whether the cache
+    has it).
+
+    The index is preferred over model.safetensors while every shard it names exists.
+    transformers prefers model.safetensors, but save_pretrained leaves the other
+    layout's files behind when it saves into a folder that holds an earlier save of
+    the other layout: an unsharded save deletes the old shards but keeps the index,
+    and a sharded save keeps the old model.safetensors. Missing shards therefore mark
+    the index as stale, and a complete index as newer than model.safetensors.
+    """
+
+    index_path = os.path.join(snapshot_dir, INDEX_FILE)
+    if not os.path.isfile(index_path):
+        if has_file(SINGLE_FILE):
+            return None, (SINGLE_FILE,)
+        raise UnsupportedCheckpointError(
+            f"{model} has neither {SINGLE_FILE} nor {INDEX_FILE}. "
+            "Only safetensors checkpoints are supported."
+        )
+
+    with open(index_path, encoding="utf-8") as file:
+        index = json.load(file)
+    shard_files = tuple(sorted(set(index["weight_map"].values())))
+
+    missing = [shard for shard in shard_files if not has_file(shard)]
+    if not missing:
+        return index, shard_files
+
+    if has_file(SINGLE_FILE):
+        count = f"{len(missing)} of the {len(shard_files)} files it names"
+        if offline:
+            problem = f"{count} are not cached"
+        else:
+            problem = f"it is stale: {count} do not exist"
+        warnings.warn(
+            f"{INDEX_FILE} of {model} cannot be used, as {problem} "
+            f"({', '.join(missing)}). {SINGLE_FILE} is loaded instead, "
+            "as transformers does.",
+            stacklevel=3,
+        )
+        return None, (SINGLE_FILE,)
+
+    # Shards that are merely not cached are reported by fetch_shards.
+    if offline:
+        return index, shard_files
+
+    raise UnsupportedCheckpointError(
+        f"{len(missing)} of the {len(shard_files)} safetensors files that {INDEX_FILE} "
+        f"of {model} names do not exist ({', '.join(missing)}), and there is no "
+        f"{SINGLE_FILE}."
     )
 
 

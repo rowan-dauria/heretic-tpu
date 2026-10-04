@@ -6,6 +6,7 @@
 import json
 import math
 import os
+import re
 import shutil
 import threading
 import time
@@ -606,22 +607,193 @@ def test_resolve_checkpoint_local(checkpoints, tmp_path) -> None:
     assert ckpt.shard_files == ("model.safetensors",)
     assert ckpt.raw_config == json.loads((directory / "config.json").read_text())
     assert ckpt.config.model_type == "llama"
-    # From generation_config.json, which save_pretrained writes.
+    # From generation_config.json, which save_pretrained writes (without it, see
+    # test_generation_config_without_its_file_comes_from_config_json).
     assert (directory / "generation_config.json").exists()
     assert ckpt.generation_config.eos_token_id == ckpt.config.eos_token_id
 
-    # Without generation_config.json, the generation config comes from the config.
+    # Only safetensors checkpoints are supported.
     bare = tmp_path / "bare"
     bare.mkdir()
     for name in ("config.json", "model.safetensors"):
         (bare / name).write_bytes((directory / name).read_bytes())
-    ckpt = weights.resolve_checkpoint(str(bare), None)
-    assert ckpt.generation_config.eos_token_id == ckpt.config.eos_token_id
-
-    # Only safetensors checkpoints are supported.
+    weights.resolve_checkpoint(str(bare), None)
     (bare / "model.safetensors").unlink()
     with pytest.raises(UnsupportedCheckpointError, match="safetensors"):
         weights.resolve_checkpoint(str(bare), None)
+
+
+def _without_token_ids(config: dict) -> None:
+    for section in (config, config.get("text_config") or {}):
+        section.pop("eos_token_id", None)
+        section.pop("bos_token_id", None)
+
+
+# Checkpoints without generation_config.json: case -> (REAL_MODELS key, config.json
+# edit).
+GENERATION_CASES = {
+    # LlamaConfig and Gemma3TextConfig default to token ids that the file lacks, which
+    # the resolved config reports.
+    "llama-no-token-ids": ("llama", _without_token_ids),
+    "gemma3-no-token-ids": ("gemma3", _without_token_ids),
+    # Generation parameters in config.json, as older checkpoints ship them, which the
+    # resolved config drops.
+    "llama-legacy-parameters": (
+        "llama",
+        lambda config: config.update(
+            repetition_penalty=1.3, do_sample=True, temperature=0.7, top_k=20
+        ),
+    ),
+    # A multimodal wrapper, resolved from the top level and its text_config.
+    "mistral3": ("mistral3", lambda config: None),
+}
+
+
+@pytest.mark.parametrize("case", GENERATION_CASES)
+def test_generation_config_without_its_file_comes_from_config_json(
+    tmp_path,
+    case: str,
+) -> None:
+    from heretic_tpu.backend.engine import decode_spec
+
+    name, edit = GENERATION_CASES[case]
+    directory = build_checkpoint(
+        tiny_config(REAL_MODELS[name]), tmp_path / "ckpt", edit_config=edit
+    )
+    (directory / "generation_config.json").unlink()
+    raw_config = json.loads((directory / "config.json").read_text())
+
+    ckpt = weights.resolve_checkpoint(str(directory), None)
+    # As transformers resolves it for upstream's model.generate().
+    assert ckpt.generation_config == load_reference(directory).generation_config
+    assert ckpt.raw_config == raw_config
+
+    # Upstream's greedy calls.
+    spec = decode_spec(
+        ckpt.generation_config,
+        {"do_sample": False},
+        max_new_tokens=4,
+        chunk=1,
+        pad_id=0,
+        key=None,
+    )
+    if case.endswith("no-token-ids"):
+        assert ckpt.generation_config.eos_token_id is None
+        # Generation runs to max_new_tokens, as upstream's does.
+        assert (spec.eos_ids == -1).all()
+    elif case == "llama-legacy-parameters":
+        config = ckpt.generation_config
+        assert (config.do_sample, config.temperature, config.top_k) == (True, 0.7, 20)
+        assert spec.repetition_penalty == 1.3
+
+
+def _save_twice(directory: Path, sharded_first: bool) -> Path:
+    """
+    Saves a checkpoint into a folder that holds an earlier save of the other layout,
+    as exporting to the same folder twice does. The second save (seed 1) is current,
+    but save_pretrained leaves a file of the first behind: the index (whose shards it
+    deletes) when the first save is sharded, else model.safetensors.
+    """
+
+    config = tiny_config(REAL_MODELS["qwen3"])
+    for seed, sharded in enumerate((sharded_first, not sharded_first)):
+        build_checkpoint(
+            config,
+            directory,
+            seed=seed,
+            max_shard_size="100KB" if sharded else None,
+        )
+
+    files = {path.name for path in directory.iterdir()}
+    assert {weights.INDEX_FILE, weights.SINGLE_FILE} <= files
+    return directory
+
+
+@pytest.mark.parametrize(
+    "sharded_first", [True, False], ids=["stale-index", "stale-single-file"]
+)
+def test_resaved_folder_loads_the_latest_save(
+    tmp_path,
+    recwarn,
+    sharded_first: bool,
+) -> None:
+    directory = _save_twice(tmp_path / "ckpt", sharded_first)
+    latest = build_checkpoint(
+        tiny_config(REAL_MODELS["qwen3"]),
+        tmp_path / "latest",
+        seed=1,
+        max_shard_size=None if sharded_first else "100KB",
+    )
+
+    ckpt, _, arch, _, params = _load(directory)
+    flat = _flatten(params)
+    stale = [w for w in recwarn if "cannot be used" in str(w.message)]
+
+    if sharded_first:
+        assert len(stale) == 1
+        assert "stale" in str(stale[0].message)
+        assert ckpt.index is None
+        assert ckpt.shard_files == (weights.SINGLE_FILE,)
+        # transformers loads model.safetensors too.
+        reference = _reference_params(load_reference(directory), arch)
+        for path, expected in reference.items():
+            np.testing.assert_array_equal(
+                np.asarray(flat[path]), expected.detach().numpy()
+            )
+    else:
+        # A complete index is newer than model.safetensors, which transformers would
+        # load (see Divergences from upstream in DESIGN.md).
+        assert not stale
+        assert ckpt.index == json.loads((directory / weights.INDEX_FILE).read_text())
+        assert weights.SINGLE_FILE not in ckpt.shard_files
+
+    _, _, _, _, expected = _load(latest)
+    for path, value in _flatten(expected).items():
+        np.testing.assert_array_equal(np.asarray(flat[path]), np.asarray(value))
+
+
+def test_index_with_missing_shards_and_no_single_file_raises(tmp_path) -> None:
+    directory = _build("phi3-sharded", tmp_path / "ckpt")
+    index = json.loads((directory / weights.INDEX_FILE).read_text())
+    missing = max(index["weight_map"].values())
+    (directory / missing).unlink()
+
+    with pytest.raises(UnsupportedCheckpointError, match=missing):
+        weights.resolve_checkpoint(str(directory), None)
+
+
+@pytest.mark.parametrize("offline", [False, True], ids=["online", "offline"])
+def test_stale_index_on_the_hub_is_ignored(
+    tmp_path,
+    hub_cache,
+    monkeypatch,
+    offline: bool,
+) -> None:
+    repo = _save_twice(tmp_path / "repo", sharded_first=True)
+
+    if offline:
+        # The cached snapshot has the index but none of its shards.
+        _fill_hub_cache(repo, hub_cache)
+        monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+        expected = ["local cache", f"{weights.INDEX_FILE} .* are not cached"]
+    else:
+        hub = FakeHub(tmp_path / "cache", {"org/model": repo})
+        hub.install(monkeypatch)
+        expected = [f"{weights.INDEX_FILE} .* is stale"]
+
+    with pytest.warns(UserWarning) as caught:
+        ckpt = weights.resolve_checkpoint("org/model", None)
+    messages = [str(warning.message) for warning in caught]
+    for pattern in expected:
+        assert any(re.search(pattern, message) for message in messages), pattern
+    assert ckpt.offline == offline
+    assert ckpt.index is None
+    assert ckpt.shard_files == (weights.SINGLE_FILE,)
+
+    _load_resolved(ckpt)
+    if not offline:
+        downloaded = {name for _, name in hub.downloads}
+        assert downloaded - set(weights.METADATA_FILES) == {weights.SINGLE_FILE}
 
 
 def test_missing_or_misshapen_tensors_raise_before_reading(
