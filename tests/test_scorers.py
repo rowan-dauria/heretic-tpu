@@ -144,11 +144,11 @@ def jax_lm_instances(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
 @pytest.fixture
 def upstream(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """Upstream Heretic's own modules, imported from the submodule."""
+    """Upstream Heretic's own modules, imported from the heretic/ checkout."""
     for module_name in ["torch", "accelerate", "peft"]:
         pytest.importorskip(module_name)
     if not (UPSTREAM_SOURCE / "heretic" / "scorers" / "keyword_rate.py").exists():
-        pytest.skip("the upstream submodule is not checked out")
+        pytest.skip("upstream Heretic is not checked out in heretic/")
 
     monkeypatch.syspath_prepend(str(UPSTREAM_SOURCE))
 

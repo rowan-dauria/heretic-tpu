@@ -13,6 +13,10 @@ wheels/
 /.ruff_cache/
 /.pytest_cache/
 
+# Optional local checkout of upstream Heretic (p-e-w/heretic), which the tests that
+# compare with upstream read when it is present
+/heretic/
+
 # Throwaway scripts (synced to the TPU VM by scripts/tpu.sh)
 /.scratch/
 

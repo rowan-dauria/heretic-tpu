@@ -74,11 +74,11 @@ def pypi_installation(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def upstream(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """Upstream Heretic's own modules, imported from the submodule."""
+    """Upstream Heretic's own modules, imported from the heretic/ checkout."""
     pytest.importorskip("torch")
     pytest.importorskip("accelerate")
     if not (UPSTREAM_SOURCE / "heretic" / "reproduce.py").exists():
-        pytest.skip("the upstream submodule is not checked out")
+        pytest.skip("upstream Heretic is not checked out in heretic/")
 
     monkeypatch.syspath_prepend(str(UPSTREAM_SOURCE))
     upstream_config = importlib.import_module("heretic.config")

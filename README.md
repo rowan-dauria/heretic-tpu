@@ -135,7 +135,7 @@ behavioural divergence from upstream.
 ## Development
 
 ```sh
-git submodule update --init                 # upstream Heretic, which some tests compare with
+git clone https://github.com/p-e-w/heretic.git heretic && git -C heretic checkout 662e4ba   # optional, see below
 uv sync --extra tpu --group parity          # parity tests need CPU-only PyTorch, PEFT and Accelerate
 uv run pytest -m "not slow"                 # unit and parity tests (CPU)
 uv run pytest -m slow tests/e2e             # end-to-end CLI runs on tiny checkpoints
@@ -148,8 +148,12 @@ tests read configurations and safetensors headers of real models at pinned commi
 and cache them, so after one run with Hub access `-m "not slow"` also runs with
 `HF_HUB_OFFLINE=1`.
 
-[`scripts/tpu.sh`](scripts/tpu.sh) syncs the working tree (with the `heretic/`
-submodule and the git-ignored `.scratch/` directory for throwaway scripts) to a TPU VM
+Some tests compare the port with upstream Heretic. They read it from a git-ignored
+checkout in `heretic/` (the upstream commit the port tracks is 662e4ba) and are skipped
+without one.
+
+[`scripts/tpu.sh`](scripts/tpu.sh) syncs the working tree (with `heretic/`, if present,
+and the git-ignored `.scratch/` directory for throwaway scripts) to a TPU VM
 over IAP and runs commands there under a lock, because only one process can use the
 TPU at a time. `run` and `exec` give up with exit status 75 if another job holds the
 lock for `TPU_LOCK_WAIT` seconds (default 300); `submit` starts a detached job that
@@ -164,8 +168,7 @@ scripts/tpu.sh submit bench 'python scripts/bench_engine.py'   # detached; then:
 scripts/tpu.sh logs bench
 ```
 
-Set `TPU_REMOTE_DIR` to give each concurrent user their own checkout on the VM. The
-upstream sources this port tracks are pinned in the `heretic/` submodule.
+Set `TPU_REMOTE_DIR` to give each concurrent user their own checkout on the VM.
 
 ## Licence and acknowledgements
 

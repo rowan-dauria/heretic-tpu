@@ -6,7 +6,8 @@ written. Every behaviour that differs from upstream is listed under
 [Divergences from upstream](#divergences-from-upstream); anything not listed there
 must behave as upstream does.
 
-Upstream reference: `heretic/` (git submodule, p-e-w/heretic @ 662e4ba), which runs
+Upstream reference: p-e-w/heretic @ 662e4ba (optionally checked out, git-ignored, in
+`heretic/`), which runs
 on transformers 5.x. The rules below were checked against transformers 5.17,
 lm-eval 0.4.13 and jax 0.11.2. heretic-tpu needs Python 3.12 or newer (jax 0.11
 requires it). `pyproject.toml` requires `jax~=0.11.2` (releases before 0.11.2 compile
@@ -1783,9 +1784,10 @@ for all models, written atomically), so after one run with Hub access the defaul
 selection runs with `HF_HUB_OFFLINE=1`; without a cached index and without the Hub,
 those tests fail with a `RuntimeError` saying so.
 
-Tests that compare with upstream Heretic import it from the `heretic/` submodule and
-skip when it is not checked out, except where `HERETIC_TPU_REQUIRE_UPSTREAM=1`, which
-`scripts/tpu.sh` sets on the VM: there such a skip is reported as a failure.
+Tests that compare with upstream Heretic import it from a git-ignored checkout in
+`heretic/` and skip when it is not present, except where
+`HERETIC_TPU_REQUIRE_UPSTREAM=1`, which `scripts/tpu.sh` sets on the VM when the synced
+working tree has that checkout: there such a skip is reported as a failure.
 
 * **Forward parity**, per family: logits at all positions, hidden states, module I/O
   and greedy generations. Cases: llama (llama3 RoPE; tied, no `lm_head`; and a copy
@@ -2008,13 +2010,14 @@ skip when it is not checked out, except where `HERETIC_TPU_REQUIRE_UPSTREAM=1`, 
 * `scripts/tpu.sh` (configured by `TPU_NAME`, `TPU_ZONE`, `TPU_PROJECT` and
   `TPU_REMOTE_DIR`, the remote checkout relative to `$HOME`, one per concurrent user)
   runs everything on the TPU VM over IAP. `sync` copies the working tree (tracked and
-  untracked non-ignored files, the files of the `heretic/` submodule in place of its
-  gitlink, and the git-ignored `.scratch/` directory for throwaway scripts),
+  untracked non-ignored files, the git-ignored `heretic/` checkout without its `.git`
+  directory when present, and the git-ignored `.scratch/` directory for throwaway
+  scripts),
   tolerating tracked files deleted without staging; `run` syncs and runs a command,
   `exec` runs without syncing, `setup` installs uv and the shared virtual environment
   (`uv sync --extra tpu --group dev --group parity`). Remote commands run with that
   environment activated, `PYTHONPATH` at the synced `src/`, and
-  `HERETIC_TPU_REQUIRE_UPSTREAM=1`. Only one process can use the TPU, so commands take
+  `HERETIC_TPU_REQUIRE_UPSTREAM=1` when `heretic/` was synced. Only one process can use the TPU, so commands take
   an exclusive lock: `run` and `exec` give up with exit status 75 after
   `TPU_LOCK_WAIT` seconds (default 300) when another job holds it, and `TPU_LOCK=0`
   skips the lock for commands that do not touch the TPU (for example with

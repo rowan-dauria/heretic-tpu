@@ -56,31 +56,32 @@ def write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def make_checkout(root: Path, scratch: bool) -> Path:
+def make_checkout(root: Path, scratch: bool, upstream: bool = True) -> Path:
     """
-    A checkout with scripts/tpu.sh, an upstream submodule at heretic/ and, if
-    `scratch` is set, a git-ignored .scratch/ directory.
+    A checkout with scripts/tpu.sh and, if `upstream` is set, a git-ignored clone of
+    upstream Heretic at heretic/, and if `scratch` is set, a git-ignored .scratch/
+    directory.
     """
-    upstream = root / "upstream"
-    write(upstream / "README.md", "upstream\n")
-    write(upstream / "src" / "heretic" / "config.py", "upstream = True\n")
-    write(upstream / "z.py", "last = True\n")
-    git(upstream, "init", "-q")
-    git(upstream, "add", "-A")
-    git(upstream, "commit", "-qm", "upstream")
-
     checkout = root / "checkout"
-    write(checkout / ".gitignore", "/.scratch/\n/ignored.txt\n")
+    write(checkout / ".gitignore", "/heretic/\n/.scratch/\n/ignored.txt\n")
     write(checkout / "ignored.txt", "ignored\n")
     write(checkout / "src" / "heretic_tpu" / "a.py", "a = 1\n")
     write(checkout / "src" / "heretic_tpu" / "z.py", "z = 1\n")
     (checkout / "scripts").mkdir()
     shutil.copy(REPO_ROOT / "scripts" / "tpu.sh", checkout / "scripts" / "tpu.sh")
     git(checkout, "init", "-q")
-    git(checkout, "submodule", "add", str(upstream), "heretic")
     git(checkout, "add", "-A")
     git(checkout, "commit", "-qm", "checkout")
     write(checkout / "untracked.py", "untracked = True\n")
+
+    if upstream:
+        write(checkout / "heretic" / "README.md", "upstream\n")
+        write(
+            checkout / "heretic" / "src" / "heretic" / "config.py", "upstream = True\n"
+        )
+        write(checkout / "heretic" / "z.py", "last = True\n")
+        # The clone's own repository, which must not be synced.
+        write(checkout / "heretic" / ".git" / "HEAD", "ref: refs/heads/master\n")
 
     if scratch:
         write(checkout / ".scratch" / "label" / "x.py", "print(1)\n")
@@ -129,20 +130,22 @@ def remote_files(remote: Path) -> set[str]:
 
 
 @pytest.mark.parametrize(
-    ("deleted", "scratch"),
+    ("deleted", "scratch", "upstream"),
     [
-        (None, True),
-        ("src/heretic_tpu/z.py", True),
-        # The last path listed, which must not drop .scratch/ or fail the sync.
-        ("heretic/z.py", False),
+        (None, True, True),
+        ("src/heretic_tpu/z.py", True, True),
+        ("heretic/z.py", False, True),
+        # Without a checkout of upstream, the upstream tests are not required.
+        (None, True, False),
     ],
 )
 def test_run_syncs_the_working_tree(
     tmp_path: Path,
     deleted: str | None,
     scratch: bool,
+    upstream: bool,
 ) -> None:
-    checkout = make_checkout(tmp_path, scratch)
+    checkout = make_checkout(tmp_path, scratch, upstream)
     # A tracked file deleted without staging the deletion, which git still lists.
     if deleted is not None:
         (checkout / deleted).unlink()
@@ -161,19 +164,21 @@ def test_run_syncs_the_working_tree(
     )
 
     assert result.returncode == 0, result.stderr
-    assert f"REQUIRE_UPSTREAM=1 in {remote}" in result.stdout
+    assert f"REQUIRE_UPSTREAM={int(upstream)} in {remote}" in result.stdout
 
     expected = {
         ".gitignore",
-        ".gitmodules",
         "scripts/tpu.sh",
         "src/heretic_tpu/a.py",
         "src/heretic_tpu/z.py",
         "untracked.py",
-        "heretic/README.md",
-        "heretic/src/heretic/config.py",
-        "heretic/z.py",
     }
+    if upstream:
+        expected |= {
+            "heretic/README.md",
+            "heretic/src/heretic/config.py",
+            "heretic/z.py",
+        }
     if scratch:
         expected.add(".scratch/label/x.py")
     expected.discard(deleted)
@@ -216,10 +221,10 @@ import pytest
 
 @pytest.fixture
 def upstream():
-    pytest.skip("the upstream submodule is not checked out")
+    pytest.skip("upstream Heretic is not checked out in heretic/")
 
 
-@pytest.mark.skipif(True, reason="the upstream submodule is not checked out")
+@pytest.mark.skipif(True, reason="upstream Heretic is not checked out in heretic/")
 def test_skipif():
     pass
 
@@ -236,7 +241,7 @@ def test_other_skip():
     pytest.skip("requires a TPU")
 
 
-@pytest.mark.xfail(reason="the upstream submodule is not checked out")
+@pytest.mark.xfail(reason="upstream Heretic is not checked out in heretic/")
 def test_xfail():
     assert False
 """

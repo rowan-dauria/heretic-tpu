@@ -6,8 +6,7 @@
 # Usage:
 #   scripts/tpu.sh setup        Install uv and the shared virtual environment on the VM.
 #   scripts/tpu.sh sync         Copy the working tree (tracked and untracked, non-ignored files,
-#                               the files of the heretic/ submodule, and the git-ignored
-#                               .scratch/ directory).
+#                               and the git-ignored heretic/ and .scratch/ directories).
 #   scripts/tpu.sh run CMD...   Sync, then run CMD inside the synced tree on the VM.
 #   scripts/tpu.sh exec CMD...  Like run, but without syncing first.
 #   scripts/tpu.sh submit NAME CMD...
@@ -33,10 +32,10 @@
 #
 # All remote commands run with the shared virtual environment activated and with
 # PYTHONPATH pointing at the synced src/ directory, so several checkouts can share
-# one environment. They also run with HERETIC_TPU_REQUIRE_UPSTREAM=1, which makes
-# the tests that compare with upstream Heretic fail rather than skip when the
-# heretic/ submodule is missing (see tests/conftest.py), because the VM is where
-# the tests run.
+# one environment. If the working tree has a checkout of upstream Heretic in heretic/,
+# they also run with HERETIC_TPU_REQUIRE_UPSTREAM=1, which makes the tests that
+# compare with upstream fail rather than skip if it did not arrive (see
+# tests/conftest.py).
 
 set -euo pipefail
 
@@ -49,6 +48,13 @@ LOCK="${TPU_LOCK:-1}"
 LOCK_WAIT="${TPU_LOCK_WAIT:-300}"
 VENV='$HOME/.venvs/heretic-tpu'
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The optional, git-ignored checkout of upstream Heretic that some tests compare with.
+if [ -d "$REPO_ROOT/heretic/src/heretic" ]; then
+    REQUIRE_UPSTREAM=1
+else
+    REQUIRE_UPSTREAM=0
+fi
 
 ssh_tpu() {
     gcloud alpha compute tpus tpu-vm ssh "$TPU_NAME" \
@@ -66,16 +72,16 @@ cd "\$HOME/$REMOTE_DIR"
 if [ -f "$VENV/bin/activate" ]; then source "$VENV/bin/activate"; fi
 export PYTHONPATH="\$HOME/$REMOTE_DIR/src\${PYTHONPATH:+:\$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
-export HERETIC_TPU_REQUIRE_UPSTREAM=1
+export HERETIC_TPU_REQUIRE_UPSTREAM=$REQUIRE_UPSTREAM
 EOF
 }
 
 do_sync() {
     # Remove previously synced code first so that deleted files don't linger.
-    # The files of the heretic/ submodule (upstream Heretic, which the parity tests
-    # compare with) are synced in place of its gitlink. The git-ignored .scratch/
-    # directory is synced as well, for throwaway scripts that should run on the VM
-    # rather than locally.
+    # The git-ignored heretic/ directory (a checkout of upstream Heretic, which some
+    # tests compare with) is synced without its .git directory, and so is the
+    # git-ignored .scratch/ directory, for throwaway scripts that should run on the
+    # VM rather than locally.
     # Paths that don't exist are dropped, because tar fails on them: git still lists
     # a tracked file that was deleted until the deletion is staged. `if` rather than
     # `&&` keeps a missing last path from failing the loop, and -L keeps dangling
@@ -83,8 +89,10 @@ do_sync() {
     (
         cd "$REPO_ROOT"
         {
-            git ls-files -z --cached --others --exclude-standard | grep -zv '^heretic$'
-            git ls-files -z --recurse-submodules --cached -- heretic
+            git ls-files -z --cached --others --exclude-standard
+            if [ "$REQUIRE_UPSTREAM" = "1" ]; then
+                find heretic -path heretic/.git -prune -o -type f -print0
+            fi
             if [ -d .scratch ]; then find .scratch -type f -print0; fi
         } | while IFS= read -r -d '' path; do
             if [ -e "$path" ] || [ -L "$path" ]; then printf '%s\0' "$path"; fi

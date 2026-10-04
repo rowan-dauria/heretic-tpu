@@ -9,10 +9,11 @@ from pathlib import Path
 import jax
 import pytest
 
-# Set by scripts/tpu.sh on the VM, where the tests run: the tests that compare with
-# upstream Heretic then fail, rather than skip, when the heretic/ submodule is missing,
-# so that they cannot go unnoticed. It is read once here, because the
-# isolated_settings_sources fixture removes HERETIC_* variables while a test runs.
+# Set by scripts/tpu.sh on the VM when the working tree it syncs has a checkout of
+# upstream Heretic in heretic/: the tests that compare with upstream then fail, rather
+# than skip, if it is missing, so that they cannot go unnoticed. It is read once here,
+# because the isolated_settings_sources fixture removes HERETIC_* variables while a
+# test runs.
 REQUIRE_UPSTREAM = os.environ.get("HERETIC_TPU_REQUIRE_UPSTREAM") == "1"
 
 
@@ -24,8 +25,8 @@ def pytest_runtest_makereport(
     report = yield
 
     # A skipif mark skips during setup, and pytest.skip() in a fixture or test
-    # during setup or the call. The reasons are "the upstream submodule is not
-    # checked out" and "the upstream source is not checked out".
+    # during setup or the call. The reasons are "upstream Heretic is not checked out
+    # in heretic/" and "the upstream source is not checked out".
     if (
         REQUIRE_UPSTREAM
         and report.skipped
@@ -37,8 +38,7 @@ def pytest_runtest_makereport(
             report.outcome = "failed"
             report.longrepr = (
                 f"{reason}, but HERETIC_TPU_REQUIRE_UPSTREAM=1 requires it "
-                "(scripts/tpu.sh syncs the heretic/ submodule; run "
-                "`git submodule update --init` locally)"
+                "(scripts/tpu.sh syncs heretic/ when the working tree has it)"
             )
 
     return report

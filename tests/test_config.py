@@ -155,7 +155,7 @@ def test_ignores_device_map_and_max_memory_in_config_toml(
 
 @pytest.mark.skipif(
     not UPSTREAM_DEFAULT_CONFIG.exists(),
-    reason="the upstream submodule is not checked out",
+    reason="upstream Heretic is not checked out in heretic/",
 )
 def test_accepts_upstream_default_config(
     capsys: pytest.CaptureFixture[str],
