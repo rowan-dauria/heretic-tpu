@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 from jax._src.dispatch import BACKEND_COMPILE_EVENT
 
-from heretic_tpu.backend import lbfgs
+from heretic_tpu.backend import lbfgs, linalg
 from heretic_tpu.config import SingleDatasetSpecification
 from heretic_tpu.model import ModuleIO
 from heretic_tpu.modifiers import ara
@@ -37,6 +37,7 @@ from heretic_tpu.modifiers.ara import (
     Parameters,
     Settings,
     ara_optimise,
+    objective_data,
 )
 from heretic_tpu.plugin import Context
 from heretic_tpu.utils import Prompt, batchify, load_prompts
@@ -630,11 +631,7 @@ def test_float32_dots_request_highest_precision(
         k_max_bad=NEIGHBOR_COUNT_MAX,
     )
     A, B, W_stack, *_ = arguments
-    data = ObjectiveData(
-        W_stack[0, 0].astype(jnp.float32),
-        jnp.ones((B.shape[0], 1)),
-        *arguments[5:11],
-    )
+    data = objective_data(W_stack[0, 0].astype(jnp.float32), *arguments[5:11])
 
     with jax.default_matmul_precision("default"):
         texts = [
@@ -704,18 +701,10 @@ def objective_inputs(
     loss_weights: np.ndarray,
     neighbor_count: int,
 ) -> ObjectiveData:
-    W_base, good_input, good_output, bad_input, bad_output = (
-        jnp.asarray(x, jnp.float32) for x in data
-    )
-    return ObjectiveData(
-        W_base=W_base,
-        W_row_norms=jnp.linalg.norm(W_base, axis=1, keepdims=True),
-        good_input=good_input,
-        good_output=good_output,
-        bad_input=bad_input,
-        bad_output=bad_output,
-        loss_weights=jnp.asarray(loss_weights, jnp.float32),
-        neighbor_count=jnp.int32(neighbor_count),
+    return objective_data(
+        *(jnp.asarray(x, jnp.float32) for x in data),
+        jnp.asarray(loss_weights, jnp.float32),
+        jnp.int32(neighbor_count),
     )
 
 
@@ -811,6 +800,112 @@ def test_small_adapter_changes_change_the_loss(
 
     change = (loss_at(B + delta) - loss_at(B - delta)) / 2
     assert change == pytest.approx(np.sum(gradient_B * delta), rel=0.05)
+
+
+def effective_weight_objective(
+    x: jax.Array,
+    data: ObjectiveData,
+    *,
+    preserve_row_magnitudes: bool,
+    k_max_good: int,
+    k_max_bad: int,
+) -> jax.Array:
+    """ARA's objective in upstream's form, through the effective weight."""
+
+    highest = jax.lax.Precision.HIGHEST
+    d_out, d_in = data.W_base.shape
+    rank = x.size // (d_in + d_out)
+    A = x[: rank * d_in].reshape(rank, d_in)
+    B = x[rank * d_in :].reshape(d_out, rank)
+
+    W_eff = data.W_base + jnp.matmul(B, A, precision=highest)
+    if preserve_row_magnitudes:
+        W_eff = linalg.normalize(W_eff, axis=1) * data.W_row_norms[:, None]
+
+    return ara.ara_loss(
+        data.good_output,
+        data.bad_output,
+        jnp.matmul(data.good_input, W_eff.T, precision=highest),
+        jnp.matmul(data.bad_input, W_eff.T, precision=highest),
+        data.loss_weights,
+        data.neighbor_count,
+        k_max_good,
+        k_max_bad,
+    )
+
+
+@pytest.mark.parametrize("preserve_row_magnitudes", [True, False])
+def test_objective_equals_the_effective_weight_form(
+    preserve_row_magnitudes: bool,
+) -> None:
+    # The objective is evaluated through the adapter's rank-r structure instead of
+    # forming W_eff = W_base + B @ A, which only reassociates the arithmetic, so in
+    # float64 its value and gradient equal upstream's form to rounding.
+    rng = np.random.default_rng(2)
+    data, A, _ = random_module(rng, 64, 128, 48, 40, 8)
+    # B @ A is about 30 % of W_base, more than ARA's optimisation reaches.
+    B = 0.3 * rng.standard_normal((64, 8)) / np.sqrt(8)
+    # A zero row of W_base with a zero adapter row: both forms give its output a
+    # zero (not NaN) gradient.
+    data[0][5] = 0
+    B[5] = 0
+    x = np.concatenate([A.ravel(), B.ravel()])
+    static = {
+        "preserve_row_magnitudes": preserve_row_magnitudes,
+        "k_max_good": NEIGHBOR_COUNT_MAX,
+        "k_max_bad": NEIGHBOR_COUNT_MAX,
+    }
+
+    with jax.default_device(jax.devices("cpu")[0]), jax.enable_x64(True):
+        inputs = objective_data(
+            *(jnp.asarray(array, jnp.float64) for array in data),
+            jnp.asarray([0.5, 0.3, 0.6], jnp.float64),
+            jnp.int32(5),
+        )
+        x = jnp.asarray(x, jnp.float64)
+        loss, gradient = jax.value_and_grad(functools.partial(ara.objective, **static))(
+            x, inputs
+        )
+        loss_desired, gradient_desired = jax.value_and_grad(
+            functools.partial(effective_weight_objective, **static)
+        )(x, inputs)
+        gradient, gradient_desired = np.asarray(gradient), np.asarray(gradient_desired)
+
+    assert np.all(np.isfinite(gradient))
+    assert float(loss) == pytest.approx(float(loss_desired), rel=1e-12)
+    error = np.linalg.norm(gradient - gradient_desired)
+    assert error / np.linalg.norm(gradient_desired) < 1e-10
+
+
+@pytest.mark.parametrize("preserve_row_magnitudes", [True, False])
+def test_objective_never_forms_the_effective_weight(
+    preserve_row_magnitudes: bool,
+) -> None:
+    # Regression test for the cost of an evaluation: neither the objective nor its
+    # gradient computes a [d_out, d_in] array (the effective weight or its gradient),
+    # so no evaluation multiplies the module inputs by a dense weight. That made an
+    # evaluation cost O(N d_in d_out) instead of O((N + d_out) d_in r).
+    arguments, _ = ara_optimise_arguments(preserve_row_magnitudes)
+    A, B, W_stack, *_ = arguments
+    d_out, d_in = W_stack.shape[2:]
+    data = objective_data(W_stack[0, 0].astype(jnp.float32), *arguments[5:11])
+    objective = functools.partial(
+        ara.objective,
+        preserve_row_magnitudes=preserve_row_magnitudes,
+        k_max_good=NEIGHBOR_COUNT_MAX,
+        k_max_bad=NEIGHBOR_COUNT_MAX,
+    )
+
+    text = str(
+        jax.make_jaxpr(jax.value_and_grad(objective))(
+            jnp.concatenate([A.ravel(), B.ravel()]), data
+        )
+    )
+    # The variables each equation defines are left of its " = ".
+    defined = [line.split(" = ")[0] for line in text.splitlines() if " = " in line]
+    assert defined
+    for shape in [f"[{d_out},{d_in}]", f"[{d_in},{d_out}]"]:
+        assert not [variables for variables in defined if shape in variables]
 
 
 def capture_module_io(

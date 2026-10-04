@@ -118,18 +118,62 @@ class Settings(BaseModel):
 
 
 class ObjectiveData(NamedTuple):
-    """The arrays that ARA's objective for a module depends on."""
+    """
+    The arrays that ARA's objective for a module depends on (built by
+    `objective_data`).
+    """
 
     W_base: Array  # [d_out, d_in], the base weight in float32
-    W_row_norms: Array  # [d_out, 1]
+    W_row_norms_squared: Array  # [d_out]
+    W_row_norms: Array  # [d_out]
     good_input: Array  # [N_good, d_in]
     good_output: Array  # [N_good, d_out]
     bad_input: Array  # [N_bad, d_in]
     bad_output: Array  # [N_bad, d_out]
+    # The outputs of the base weight, good_input @ W_baseᵀ and bad_input @ W_baseᵀ.
+    good_base_output: Array  # [N_good, d_out]
+    bad_base_output: Array  # [N_bad, d_out]
     # [3]: preserve_good_behavior_weight, steer_bad_behavior_weight
     # and overcorrect_relative_weight.
     loss_weights: Array
     neighbor_count: Array  # int32 []
+
+
+def objective_data(
+    W_base: Array,
+    good_input: Array,
+    good_output: Array,
+    bad_input: Array,
+    bad_output: Array,
+    loss_weights: Array,
+    neighbor_count: Array,
+) -> ObjectiveData:
+    """
+    The objective's data for a module, with the quantities that do not depend on
+    the adapter computed once.
+    """
+
+    W_row_norms_squared = jnp.sum(W_base * W_base, axis=1)
+
+    return ObjectiveData(
+        W_base=W_base,
+        W_row_norms_squared=W_row_norms_squared,
+        # Pre-calculate the original row norms to preserve them.
+        # See https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
+        W_row_norms=jnp.sqrt(W_row_norms_squared),
+        good_input=good_input,
+        good_output=good_output,
+        bad_input=bad_input,
+        bad_output=bad_output,
+        good_base_output=jnp.matmul(
+            good_input, W_base.T, precision=lax.Precision.HIGHEST
+        ),
+        bad_base_output=jnp.matmul(
+            bad_input, W_base.T, precision=lax.Precision.HIGHEST
+        ),
+        loss_weights=loss_weights,
+        neighbor_count=neighbor_count,
+    )
 
 
 # The objective function at the heart of ARA.
@@ -188,6 +232,14 @@ def ara_loss(
     )
 
 
+def _sqrt(squared: Array) -> Array:
+    # The square root with a zero (not NaN) gradient where its argument is not
+    # positive, as linalg.normalize's norm has at a zero row. The squared norm of a
+    # row of W_eff can round below zero only where that row (nearly) vanishes.
+    positive = squared > 0
+    return jnp.where(positive, jnp.sqrt(jnp.where(positive, squared, 1)), 0)
+
+
 def objective(
     x: Array,
     data: ObjectiveData,
@@ -206,25 +258,37 @@ def objective(
     A = x[: rank * d_in].reshape(rank, d_in)
     B = x[rank * d_in :].reshape(d_out, rank)
 
-    # Calculate effective weight after applying adapter.
-    W_eff = data.W_base + jnp.matmul(B, A, precision=lax.Precision.HIGHEST)
+    def matmul(a: Array, b: Array) -> Array:
+        return jnp.matmul(a, b, precision=lax.Precision.HIGHEST)
+
+    # Upstream forms the effective weight W_eff = W_base + B @ A, optionally
+    # normalises its rows to the original row norms, and multiplies the inputs by it.
+    # The same outputs are computed here through the adapter's rank-r structure,
+    # which only reassociates the float32 arithmetic. The inputs' products with
+    # W_base are fixed for the module (see objective_data), and forming W_eff and
+    # multiplying the inputs by it in every evaluation and its gradient cost
+    # O(N d_in d_out) rather than O((N + d_out) d_in r): for a 4B model's down_proj,
+    # about 90 GFLOP per evaluation instead of 7 (besides the k-NN distances).
+    #
+    # Outputs using the effective weight: inputs @ W_effᵀ.
+    new_good_output = data.good_base_output + matmul(matmul(data.good_input, A.T), B.T)
+    new_bad_output = data.bad_base_output + matmul(matmul(data.bad_input, A.T), B.T)
 
     if preserve_row_magnitudes:
-        # Normalize to unit length, then scale by original norms,
-        # preserving the original row norms.
-        W_eff = linalg.normalize(W_eff, axis=1) * data.W_row_norms
-
-    # Compute outputs using the effective weight.
-    new_good_output = jnp.matmul(
-        data.good_input,
-        W_eff.T,
-        precision=lax.Precision.HIGHEST,
-    )
-    new_bad_output = jnp.matmul(
-        data.bad_input,
-        W_eff.T,
-        precision=lax.Precision.HIGHEST,
-    )
+        # Normalising row i of W_eff to unit length and scaling it by the original
+        # norm ‖w_i‖ scales output i by ‖w_i‖ / max(‖w_eff_i‖, 1e-12)
+        # (F.normalize's clamp), where
+        # ‖w_eff_i‖² = ‖w_i‖² + B_i · (2 W_base Aᵀ + B A Aᵀ)_i.
+        W_eff_row_norms = _sqrt(
+            data.W_row_norms_squared
+            + jnp.sum(
+                B * (2 * matmul(data.W_base, A.T) + matmul(B, matmul(A, A.T))),
+                axis=1,
+            )
+        )
+        scale = data.W_row_norms / jnp.maximum(W_eff_row_norms, 1e-12)
+        new_good_output = new_good_output * scale
+        new_bad_output = new_bad_output * scale
 
     return ara_loss(
         data.good_output,
@@ -291,21 +355,10 @@ def ara_optimise(
     """
 
     # We need the base weight in float32 (the dtype of the adapters)
-    # to compute the effective weight.
+    # to compute the outputs and row norms of the effective weight.
     W_base = W_stack[layer, module].astype(A.dtype)
 
-    data = ObjectiveData(
-        W_base=W_base,
-        # Pre-calculate the original row norms to preserve them.
-        # See https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-        W_row_norms=jnp.linalg.norm(W_base, axis=1, keepdims=True),
-        good_input=good_in,
-        good_output=good_out,
-        bad_input=bad_in,
-        bad_output=bad_out,
-        loss_weights=loss_weights,
-        neighbor_count=k,
-    )
+    data = objective_data(W_base, good_in, good_out, bad_in, bad_out, loss_weights, k)
 
     # Like PyTorch's optimisers, L-BFGS works on the parameters
     # flattened and concatenated in order.
