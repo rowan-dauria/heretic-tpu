@@ -7,9 +7,10 @@ eager experts) on tiny random-weight checkpoints built from the configurations o
 real models: logits at every position, hidden states and module I/O of left-padded
 mixed-length batches, the LoRA path against PEFT, prefill plus decode steps against
 the full forward, RoPE switching, blocked attention, the mixture-of-experts
-combination order in bfloat16, tensor parallelism on a forced 4-device CPU mesh, and
-the memory behaviour of the KV cache. Marked `tpu`: real models in bfloat16 against
-the float32 CPU reference.
+combination order in bfloat16 and the precision of its matmuls lowered for the TPU,
+tensor parallelism on a forced 4-device CPU mesh, and the memory behaviour of the KV
+cache. Marked `tpu`: the mixture-of-experts layer and checkpoints in bfloat16, and
+real models in bfloat16 against the float32 CPU reference.
 """
 
 import dataclasses
@@ -764,13 +765,18 @@ def test_query_block_size() -> None:
     assert layers.query_block_size(8193) == 256
 
 
-@pytest.mark.parametrize("kind", ["qwen3_moe", "mixtral"])
-def test_moe_combination_order_in_bfloat16(kind: str) -> None:
+def _transformers_moe(
+    kind: str,
+    router: np.ndarray,
+    gate: np.ndarray,
+    up: np.ndarray,
+    down: np.ndarray,
+    top_k: int,
+) -> Any:
     """
-    The routed MLP in bfloat16 equals transformers' eager expert loop bit for bit on
-    inputs for which every matmul is exact in float32, so that only the roundings to
-    bfloat16 remain, and on which combining the experts in top-k rank order instead
-    of ascending expert index gives a different result.
+    Transformers' sparse MoE block of `kind` ("qwen3_moe" or "mixtral") in bfloat16,
+    with eager experts and normalised top-k weights, holding router [E, D], gate,
+    up [E, I_e, D] and down [E, D, I_e] (arrays of bfloat16 values).
     """
 
     from transformers import MixtralConfig, Qwen3MoeConfig
@@ -779,7 +785,7 @@ def test_moe_combination_order_in_bfloat16(kind: str) -> None:
         Qwen3MoeSparseMoeBlock,
     )
 
-    hidden, experts, top_k, width, tokens = 32, 8, 3, 16, 256
+    experts, width, hidden = gate.shape
     if kind == "qwen3_moe":
         config = Qwen3MoeConfig(
             hidden_size=hidden,
@@ -798,7 +804,34 @@ def test_moe_combination_order_in_bfloat16(kind: str) -> None:
         )
         block_class = MixtralSparseMoeBlock
     config._experts_implementation = "eager"
-    block = block_class(config).to(torch.bfloat16)
+
+    def tensor(array: np.ndarray) -> Any:
+        # Shares the memory of the bfloat16 array: real expert widths take gigabytes.
+        bits = np.ascontiguousarray(array, dtype=ml_dtypes.bfloat16).view(np.int16)
+        return torch.from_numpy(bits).view(torch.bfloat16)
+
+    # Built without allocating its parameters, which are then assigned.
+    with torch.device("meta"):
+        block = block_class(config)
+    state = {
+        "gate.weight": tensor(router),
+        "experts.gate_up_proj": tensor(np.concatenate([gate, up], 1)),
+        "experts.down_proj": tensor(down),
+    }
+    block.load_state_dict(state, assign=True)
+    return block.eval()
+
+
+@pytest.mark.parametrize("kind", ["qwen3_moe", "mixtral"])
+def test_moe_combination_order_in_bfloat16(kind: str) -> None:
+    """
+    The routed MLP in bfloat16 equals transformers' eager expert loop bit for bit on
+    inputs for which every matmul is exact in float32, so that only the roundings to
+    bfloat16 remain, and on which combining the experts in top-k rank order instead
+    of ascending expert index gives a different result.
+    """
+
+    hidden, experts, top_k, width, tokens = 32, 8, 3, 16, 256
 
     # Coarse grids keep every product and sum of the matmuls exact in float32.
     # A constant input feature with a large gate weight keeps the gate outputs above
@@ -822,13 +855,9 @@ def test_moe_combination_order_in_bfloat16(kind: str) -> None:
     x = x[logits[:, top_k - 1] != logits[:, top_k]]
     assert len(x) > tokens // 2
 
+    block = _transformers_moe(kind, router, gate, up, down, top_k)
     inputs = torch.from_numpy(x).bfloat16()
     with torch.no_grad():
-        block.gate.weight.copy_(torch.from_numpy(router))
-        block.experts.gate_up_proj.copy_(
-            torch.from_numpy(np.concatenate([gate, up], 1))
-        )
-        block.experts.down_proj.copy_(torch.from_numpy(down))
         expected = block(inputs[None])[0]
 
         # The same contributions, combined in rank order.
@@ -852,6 +881,9 @@ def test_moe_combination_order_in_bfloat16(kind: str) -> None:
         )
     )
     bfloat16 = ml_dtypes.bfloat16
+    # On the CPU only: on the TPU, XLA's default excess precision for fused
+    # elementwise code skips some of the per-addition roundings to bfloat16, so the
+    # result is a bfloat16 ulp away in places (test_moe_in_bfloat16_on_tpu covers it).
     with jax.default_device(jax.devices("cpu")[0]):
         actual = moe(
             x.astype(bfloat16),
@@ -863,6 +895,255 @@ def test_moe_combination_order_in_bfloat16(kind: str) -> None:
     np.testing.assert_array_equal(
         np.asarray(actual).astype(np.float32), expected.float().numpy()
     )
+
+
+# Mixture-of-experts shapes (hidden size, experts, expert width, experts per token,
+# tokens): those of the tiny test checkpoints, and the real models' at prefill.
+MOE_SHAPES = {
+    ("qwen3_moe", "tiny"): (64, 4, 32, 2, 64),
+    ("mixtral", "tiny"): (64, 4, 32, 2, 64),
+    ("qwen3_moe", "real"): (2048, 128, 768, 8, 128),  # Qwen3-30B-A3B
+    ("mixtral", "real"): (4096, 8, 14336, 2, 32),  # Mixtral-8x7B
+}
+
+
+def _ragged_dot_precisions(text: str) -> list[tuple[str, str, str]]:
+    """
+    The operand element types and precisions of every ragged dot in StableHLO text
+    lowered for the TPU (`chlo.ragged_dot` composites).
+    """
+
+    import re
+
+    found = []
+    for line in text.splitlines():
+        if 'stablehlo.composite "chlo.ragged_dot"' not in line:
+            continue
+        precision = re.search(r'precision_config = \["(\w+)", "(\w+)"\]', line)
+        operands = re.search(r": \(tensor<[^>]*x(\w+)>, tensor<[^>]*x(\w+)>", line)
+        assert precision and operands, line
+        assert operands.group(1) == operands.group(2), line
+        found.append((operands.group(1), *precision.groups()))
+    return found
+
+
+@pytest.mark.parametrize("dtype", [ml_dtypes.bfloat16, np.float32])
+def test_moe_matmuls_lower_for_tpu_at_supported_precisions(dtype) -> None:
+    """
+    The grouped matmuls of the routed MLP, lowered for the TPU (from any backend),
+    request DEFAULT precision for bfloat16 operands and HIGHEST for float32 ones.
+    XLA:TPU computes a ragged dot with a Mosaic kernel that fails to compile for
+    bfloat16 operands at HIGHEST, the default precision heretic_tpu.backend sets, so
+    that no mixture-of-experts model could run in bfloat16 on a TPU. In bfloat16,
+    DEFAULT is a single pass with exact products and float32 accumulation.
+    """
+
+    hidden, experts, width, top_k, tokens = MOE_SHAPES["qwen3_moe", "tiny"]
+    moe = functools.partial(
+        layers.routed_moe,
+        top_k=top_k,
+        normalise=True,
+        float32_weights=False,
+        activation_name="silu",
+    )
+    shapes = [
+        (tokens, hidden),
+        (experts, hidden),
+        (experts, width, hidden),
+        (experts, width, hidden),
+        (experts, hidden, width),
+    ]
+    exported = jax.export.export(jax.jit(moe), platforms=["tpu"])(
+        *(jax.ShapeDtypeStruct(shape, dtype) for shape in shapes)
+    )
+
+    element = "bf16" if dtype == ml_dtypes.bfloat16 else "f32"
+    precision = "DEFAULT" if dtype == ml_dtypes.bfloat16 else "HIGHEST"
+    # Gate, up and down.
+    assert (
+        _ragged_dot_precisions(exported.mlir_module())
+        == [(element, precision, precision)] * 3
+    )
+
+
+@pytest.mark.tpu
+@requires_tpu
+@pytest.mark.parametrize("dtype", [ml_dtypes.bfloat16, np.float32])
+@pytest.mark.parametrize("size", ["tiny", "real"])
+def test_grouped_linear_on_tpu(size: str, dtype) -> None:
+    """
+    The grouped matmul of the routed MLP compiles on the TPU in both model dtypes,
+    at the widths of the tiny checkpoints and of Qwen3-30B-A3B, in both orientations
+    (gate and up, down). In bfloat16 it equals the exact per-expert products rounded
+    to bfloat16, on grid inputs for which the float32 accumulation is exact whatever
+    its order. In float32 it is true float32 (a single bfloat16 pass would be off by
+    about 1e-3).
+    """
+
+    hidden, experts, width, top_k, tokens = MOE_SHAPES["qwen3_moe", size]
+    rows = tokens * top_k
+    rng = np.random.default_rng(10)
+    # Rows grouped by expert; no row chose expert 0.
+    group_sizes = np.bincount(rng.integers(1, experts, rows), minlength=experts)
+    group_sizes = group_sizes.astype(np.int32)
+    starts = np.cumsum(group_sizes) - group_sizes
+
+    grouped_linear = jax.jit(layers._grouped_linear)
+    for d_in, d_out in [(hidden, width), (width, hidden)]:
+        if dtype == ml_dtypes.bfloat16:
+            # Products are multiples of 2⁻⁸ of magnitude at most 1/4, so every partial
+            # sum is a multiple of 2⁻⁸ below 2⁹, which float32 represents exactly.
+            x = rng.integers(-8, 9, (rows, d_in)) / 8
+            w = rng.integers(-8, 9, (experts, d_out, d_in)) / 32
+        else:
+            x = rng.standard_normal((rows, d_in), dtype=np.float32)
+            w = rng.standard_normal((experts, d_out, d_in), dtype=np.float32)
+            w /= np.float32(math.sqrt(d_in))
+        x, w = x.astype(dtype), w.astype(dtype)
+
+        actual = np.asarray(grouped_linear(x, w, group_sizes)).astype(np.float64)
+        exact = np.concatenate(
+            [
+                x[start : start + count].astype(np.float64)
+                @ w[expert].astype(np.float64).T
+                for expert, (start, count) in enumerate(zip(starts, group_sizes))
+            ]
+        )
+
+        if dtype == ml_dtypes.bfloat16:
+            rounded = exact.astype(np.float32).astype(dtype).astype(np.float64)
+            np.testing.assert_array_equal(actual, rounded)
+        else:
+            error = np.abs(actual - exact).max() / np.abs(exact).max()
+            assert error < 1e-5, (d_in, d_out, error)
+
+
+def _bfloat16_ulp(value: Any) -> Any:
+    """The spacing of bfloat16 numbers (8 significant bits) at the magnitude `value`."""
+
+    return 2.0 ** (np.floor(np.log2(value)) - 7)
+
+
+@functools.partial(jax.jit, static_argnames="top_k")
+def _selected_experts(x: jax.Array, router: jax.Array, top_k: int) -> jax.Array:
+    """The experts `layers.routed_moe` chooses for each token, in ascending order."""
+
+    probs = jax.nn.softmax(layers.linear(x, router).astype(jnp.float32), axis=-1)
+    return jnp.sort(jax.lax.top_k(probs, top_k)[1], axis=-1)
+
+
+@pytest.mark.tpu
+@requires_tpu
+@pytest.mark.parametrize("size", ["tiny", "real"])
+@pytest.mark.parametrize("kind", ["qwen3_moe", "mixtral"])
+def test_moe_in_bfloat16_on_tpu(kind: str, size: str) -> None:
+    """
+    The routed MLP compiles on the TPU in bfloat16, at the widths of the tiny
+    checkpoints and of the real models, and matches transformers' eager expert loop
+    in bfloat16 (on the CPU) to a few bfloat16 ulps on the tokens for which both
+    choose the same experts. They choose differently only where the router logits
+    tie at the top-k boundary up to bfloat16 rounding.
+    """
+
+    hidden, experts, width, top_k, tokens = MOE_SHAPES[kind, size]
+    rng = np.random.default_rng(9)
+
+    def normal(shape: tuple[int, ...], scale: float) -> np.ndarray:
+        values = rng.standard_normal(shape, dtype=np.float32) * np.float32(scale)
+        return values.astype(ml_dtypes.bfloat16)
+
+    x = normal((tokens, hidden), 1.0)
+    router = normal((experts, hidden), hidden**-0.5)
+    gate = normal((experts, width, hidden), hidden**-0.5)
+    up = normal((experts, width, hidden), hidden**-0.5)
+    down = normal((experts, hidden, width), width**-0.5)
+
+    moe = jax.jit(
+        functools.partial(
+            layers.routed_moe,
+            top_k=top_k,
+            normalise=True,
+            float32_weights=kind == "mixtral",
+            activation_name="silu",
+        )
+    )
+    actual = np.asarray(moe(x, router, gate, up, down)).astype(np.float32)
+    selected = np.asarray(_selected_experts(x, router, top_k))
+
+    block = _transformers_moe(kind, router, gate, up, down, top_k)
+    inputs = torch.from_numpy(x.astype(np.float32)).bfloat16()
+    with torch.no_grad():
+        expected = block(inputs[None])[0].float().numpy()
+        _, _, reference_selected = block.gate(inputs)
+    reference_selected = np.sort(reference_selected.numpy(), axis=-1)
+
+    same = np.all(selected == reference_selected, axis=-1)
+    scale = np.abs(expected).max()
+    difference = np.abs(actual - expected)[same].max() / _bfloat16_ulp(scale)
+
+    # Both round router logits accumulated in float32 to bfloat16, each within about
+    # half an ulp of the exact logit, so they can choose differently only where the
+    # exact top_k-th and next largest logits are about an ulp apart or closer.
+    exact = x.astype(np.float64) @ router.astype(np.float64).T
+    boundary = -np.sort(-exact, axis=-1)[:, top_k - 1 : top_k + 1]
+    gap = (boundary[:, 0] - boundary[:, 1]) / _bfloat16_ulp(
+        np.abs(boundary).max(axis=-1)
+    )
+
+    print(
+        f"\n{kind} {size}: same experts for {same.sum()}/{tokens} tokens, max |diff| "
+        f"{difference:.2f} ulps on those (scale {scale:.3f}); boundary logit gaps "
+        f"of the others {np.round(gap[~same], 2).tolist()} ulps"
+    )
+    assert np.all(np.isfinite(actual))
+    assert same.mean() >= 0.5
+    assert difference <= 4
+    assert np.all(same | (gap <= 2))
+
+
+@pytest.mark.tpu
+@requires_tpu
+@pytest.mark.parametrize("name", ["qwen3_moe", "mixtral"])
+def test_moe_checkpoint_in_bfloat16_on_tpu(models, name: str) -> None:
+    """
+    A mixture-of-experts checkpoint runs in bfloat16 on the TPU (the model loader's
+    smoke test used to fail, so that it fell back to float32), with logits whose
+    divergence from the float32 transformers reference is about that of transformers
+    itself in bfloat16.
+    """
+
+    model = models(name)
+    arch, params = _load(model.directory, ml_dtypes.bfloat16)
+    tokens, mask = _batch(arch, [24, 19, 9, 1], 24)
+    logits = _jitted(transformer.logits_all, arch)(params, None, tokens, mask)
+    logits = np.asarray(logits).astype(np.float32)[mask]
+
+    def reference_logits(reference: Any) -> np.ndarray:
+        positions = np.where(mask, np.cumsum(mask, axis=1) - 1, 0)
+        with torch.no_grad():
+            output = reference(
+                input_ids=torch.from_numpy(tokens).long(),
+                attention_mask=torch.from_numpy(mask).long(),
+                position_ids=torch.from_numpy(positions).long(),
+            )
+        return output.logits.float().numpy()[mask]
+
+    expected = reference_logits(model.reference)
+    reference_bfloat16 = load_reference(model.directory, torch.bfloat16)
+    reference_bfloat16.set_experts_implementation("eager")
+    torch_logits = reference_logits(reference_bfloat16)
+
+    def kl_divergence(p_logits: np.ndarray, q_logits: np.ndarray) -> float:
+        log_p = jax.nn.log_softmax(p_logits, axis=-1)
+        log_q = jax.nn.log_softmax(q_logits, axis=-1)
+        return float(jnp.mean(jnp.sum(jnp.exp(log_p) * (log_p - log_q), axis=-1)))
+
+    kl = kl_divergence(expected, logits)
+    torch_kl = kl_divergence(expected, torch_logits)
+    print(f"\n{name}: KL to float32 {kl:.3e}, transformers in bfloat16 {torch_kl:.3e}")
+    assert np.all(np.isfinite(logits))
+    # As for the real models below.
+    assert kl <= 2 * torch_kl + 1e-3
 
 
 def _float32_dot_precisions(text: str) -> list[str]:

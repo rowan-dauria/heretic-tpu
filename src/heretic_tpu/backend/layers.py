@@ -359,11 +359,21 @@ def _grouped_linear(
         lhs_ragged_dimensions=[0],
         rhs_group_dimensions=[0],
     )
+    # The precision is explicit rather than the global "highest" (backend/__init__.py)
+    # because XLA:TPU lowers a ragged dot to a Mosaic kernel that fails to compile for
+    # bfloat16 operands at HIGHEST ("Bad lhs type"). A bfloat16 × bfloat16 dot at
+    # DEFAULT is a single MXU pass with exact products and float32 accumulation, as
+    # `linear` computes; a float32 one keeps HIGHEST, the true float32 of upstream.
+    if x.dtype == jnp.float32:
+        precision = lax.Precision.HIGHEST
+    else:
+        precision = lax.Precision.DEFAULT
     return lax.ragged_dot_general(
         x,
         weights,
         group_sizes,
         numbers,
+        precision=precision,
         preferred_element_type=jnp.float32,
     ).astype(x.dtype)
 
