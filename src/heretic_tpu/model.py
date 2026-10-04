@@ -629,6 +629,7 @@ class Model:
         rows: _Rows,
         key: Callable[[int], ShapeKey],
         run: Callable[[TokenBatch], R],
+        max_new_tokens: int | None = None,
     ) -> list[tuple[np.ndarray, R]]:
         """
         Runs `run` on engine batches covering every row, following the engine shape
@@ -640,6 +641,18 @@ class Model:
         batches of at most B_eff rows, padded with filler rows; after an out-of-memory
         error, the rows of the failed batch are run again from the start in batches
         of the lowered B_eff.
+
+        For generation, `max_new_tokens` is the number of tokens generated per row,
+        and rows are packed across buckets instead: they are taken longest bucket
+        first (each bucket in its original order), and a batch of bucket T is filled
+        up to B_eff with the following rows of shorter buckets, left-padded to T, as
+        long as that at most doubles their KV-cache length (T + max_new_tokens <=
+        2 (T_row + max_new_tokens)). A decode step costs about the same for any batch
+        size, because it is dominated by reading the weights, so this saves whole
+        decodes: for the default refusal prompts on Qwen3-4B, one in place of two per
+        call. Results do not depend on the bucket beyond rounding, and ref_len carries
+        what they depend on of upstream's batches (see "Engine shape policy" in
+        docs/DESIGN.md).
         """
 
         pad_id = self.tokenizer.pad_token_id
@@ -648,22 +661,40 @@ class Model:
             batch = token_batch(rows.tokens, rows.ref_len, pad_id=pad_id)
             return [(np.arange(len(rows.tokens)), run(batch))]
 
-        groups: dict[int, list[int]] = {}
-        for index, tokens in enumerate(rows.tokens):
-            groups.setdefault(bucket_length(len(tokens)), []).append(index)
+        buckets = [bucket_length(len(tokens)) for tokens in rows.tokens]
+        if max_new_tokens is None:
+            groups: dict[int, list[int]] = {}
+            for index, bucket in enumerate(buckets):
+                groups.setdefault(bucket, []).append(index)
+            streams = [indices for _, indices in sorted(groups.items())]
+        else:
+            # A stable sort, so each bucket keeps its original order.
+            streams = [sorted(range(len(buckets)), key=lambda index: -buckets[index])]
+
+        def joins(index: int, length: int) -> bool:
+            # Whether the row can run in a batch of bucket `length`.
+            if max_new_tokens is None:
+                return buckets[index] == length
+            return length + max_new_tokens <= 2 * (buckets[index] + max_new_tokens)
 
         results = []
 
-        for length, indices in sorted(groups.items()):
-            shape_key = key(length)
-            limit = self.engine.batch_limit(
-                shape_key,
-                min(self.settings.batch_size, next_power_of_two(len(indices))),
-            )
-
+        for indices in streams:
             start = 0
             while start < len(indices):
-                chunk = indices[start : start + limit]
+                # The batch's bucket is that of its first (longest) row, and the
+                # rows that can join it follow that row.
+                length = buckets[indices[start]]
+                stop = start
+                while stop < len(indices) and joins(indices[stop], length):
+                    stop += 1
+
+                shape_key = key(length)
+                limit = self.engine.batch_limit(
+                    shape_key,
+                    min(self.settings.batch_size, next_power_of_two(stop - start)),
+                )
+                chunk = indices[start : min(stop, start + limit)]
                 # Smaller batches are padded only to the next power of two,
                 # so that few batch sizes are compiled.
                 batch_size = min(limit, next_power_of_two(len(chunk)))
@@ -680,7 +711,9 @@ class Model:
                 except Exception as error:
                     if not is_out_of_memory(error):
                         raise
-                    limit = self.engine.lower_limit(shape_key, batch_size)
+                    # Records the failure, so that batch_limit returns the lowered
+                    # B_eff when the chunk's rows are run again.
+                    self.engine.lower_limit(shape_key, batch_size)
                     continue
 
                 results.append((np.array(chunk), result))
@@ -769,7 +802,10 @@ class Model:
             generated = self.engine.generate(self.params, lora, batch, spec)
             return generated.tokens, generated.finish
 
-        tokens, finish = self._in_order(self._run(rows, key, run), on_host=True)
+        tokens, finish = self._in_order(
+            self._run(rows, key, run, max_new_tokens=spec.max_new_tokens),
+            on_host=True,
+        )
 
         # Upstream decodes each batch up to the step at which its last row finished,
         # so rows that finished earlier end with padding.

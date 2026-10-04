@@ -1132,6 +1132,28 @@ def test_all_dtypes_failing(checkpoints, monkeypatch, capsys) -> None:
     assert "float32 was tried already" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("family", ["qwen3_moe", "mixtral"])
+def test_moe_checkpoints_load_in_bfloat16(tmp_path, family: str) -> None:
+    """
+    Mixture-of-experts checkpoints pass the smoke test in bfloat16 and generate in it.
+    On the TPU, their expert matmuls used to fail to compile in bfloat16 (see
+    layers._grouped_linear), so that these models silently fell back to float32, at
+    twice the device memory, or failed to load with dtypes=["bfloat16"].
+    """
+
+    directory = build(
+        tmp_path / family, family, generation_config={"eos_token_id": IM_END}
+    )
+    model = Model(make_settings(directory, dtypes=["bfloat16"]))
+    assert model.dtype == jnp.bfloat16
+    for name in ("router", "expert_gate", "expert_up", "expert_down"):
+        assert model.params["layers"][name].dtype == jnp.bfloat16
+
+    responses = model.get_responses(PROMPTS)
+    assert len(responses) == len(PROMPTS)
+    assert all(isinstance(response, str) for response in responses)
+
+
 # PRNG keys.
 
 
@@ -1245,14 +1267,21 @@ def test_out_of_memory_halves_the_batch(checkpoints, monkeypatch) -> None:
     expected_responses = model.get_responses_batched(PROMPTS)
     expected_logits = model.get_logits_batched(PROMPTS)
 
+    # The batches as (B, T): generation packs the first short prompt into the long
+    # prompts' batch, captures run each bucket separately. The first batch fails
+    # and runs again in two batches of two; the other batch keeps its size.
+    expected_shapes = {
+        "generate": [(4, 64), (2, 64), (2, 64), (4, 32)],
+        "capture": [(4, 32), (2, 32), (2, 32), (4, 64)],
+    }
     for name in ("generate", "capture"):
-        sizes = []
+        shapes = []
         lowered = []
         original = getattr(model.engine, name)
 
-        def failing(*args: Any, original=original, sizes=sizes) -> Any:
-            sizes.append(len(args[2].tokens))
-            if len(sizes) == 1:
+        def failing(*args: Any, original=original, shapes=shapes) -> Any:
+            shapes.append(args[2].tokens.shape)
+            if len(shapes) == 1:
                 raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: simulated")
             return original(*args)
 
@@ -1271,10 +1300,76 @@ def test_out_of_memory_halves_the_batch(checkpoints, monkeypatch) -> None:
                     atol=1e-6,
                 )
 
-        # The four short prompts failed together and ran again in two batches of
-        # two; the long prompts' bucket keeps its batch size.
-        assert sizes == [4, 2, 2, 4]
+        assert shapes == expected_shapes[name]
         assert [size for _, size in lowered] == [BATCH_SIZE]
+
+
+@pytest.mark.parametrize("batch_size", [BATCH_SIZE, 8])
+def test_generation_packs_rows_across_buckets(
+    model,
+    settings,
+    references,
+    batch_size,
+) -> None:
+    """
+    Generation fills the long prompts' batches with short prompts, so that a call
+    needs as few decodes as B_eff allows, and the responses are still upstream's.
+    Captures keep one bucket per batch.
+    """
+
+    settings.batch_size = batch_size
+    upstream = upstream_for(model, references)
+    prompt_lengths = lengths(model, PROMPTS)
+
+    calls = []
+    with recording(model.engine, "generate", calls):
+        responses = model.get_responses_batched(PROMPTS)
+    assert responses == upstream.get_responses_batched(PROMPTS)
+
+    # The long prompts first, then the short ones, each in their original order.
+    order = [1, 3, 5, 0, 2, 4, 6]
+    expected = {
+        BATCH_SIZE: [(4, 64, order[:4]), (4, 32, order[4:])],
+        8: [(8, 64, order)],
+    }
+    batches = [
+        (*batch.tokens.shape, np.sum(batch.mask[: batch.n_real], axis=1).tolist())
+        for _, _, batch, _ in calls
+    ]
+    assert batches == [
+        (size, length, [prompt_lengths[index] for index in rows])
+        for size, length, rows in expected[batch_size]
+    ]
+
+    calls = []
+    with recording(model.engine, "capture", calls):
+        model.get_logits_batched(PROMPTS)
+    assert [batch.tokens.shape[1] for _, _, batch, _ in calls] == [32, 64]
+
+
+def test_packing_at_most_doubles_the_cache(model, settings) -> None:
+    """
+    A row joins a batch of a longer bucket only if that at most doubles its KV-cache
+    length (bucket + max_new_tokens).
+    """
+
+    settings.batch_size = 8
+    very_long = Prompt(system=SYSTEM_PROMPT, user=f"{LONG[0]} {LONG[1]}")
+    prompts = [*PROMPTS, very_long]
+    assert 64 < lengths(model, [very_long])[0] <= 128
+
+    calls = []
+    with recording(model.engine, "generate", calls):
+        model.get_responses_batched(prompts)
+
+    # The very long prompt's batch takes the long prompts, whose cache grows from
+    # 64 + 10 to 128 + 10 tokens, but not the short ones, whose cache would grow
+    # from 32 + 10 tokens.
+    assert MAX_RESPONSE_LENGTH == 10
+    assert [(batch.tokens.shape, batch.n_real) for _, _, batch, _ in calls] == [
+        ((4, 128), 4),
+        ((4, 32), 4),
+    ]
 
 
 def test_adapters_are_reserved_only_until_they_exist(checkpoints, monkeypatch) -> None:
